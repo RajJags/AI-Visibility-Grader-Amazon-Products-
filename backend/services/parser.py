@@ -1,114 +1,121 @@
-"""ResponseParser — uses the best available LLM to extract structured mention data."""
+"""
+ResponseParser — pure text parsing, zero LLM calls.
 
-from __future__ import annotations
-import asyncio, json, re
-from llm_clients import GenerationClient
-from models import ModelMentions, ModelPositions, ParsedQueryResult, QueryResult
+Replaces the original LLM-based parser which was making 30 extra LLM calls
+(10 queries × 3 models) and adding 20-40 s to every diagnostic run.
 
-_SYSTEM = "You are a structured data extraction assistant. Always respond with valid JSON only."
-
-_PROMPT = """\
-Shopping query: "{query}"
-
-LLM response to parse:
-\"\"\"
-{response}
-\"\"\"
-
-Target brand: "{brand}"
-
-Return JSON only:
-{{
-  "mentioned": true/false,
-  "position": null or integer,
-  "competitors": ["Brand A", ...],
-  "attributes": {{"Brand A": ["attr1"], "{brand}": ["attr1"]}}
-}}
-
-Rules:
-- position is 1-indexed rank among recommended brands (null if not mentioned)
-- competitors = other proper brand names mentioned (exclude target brand)
-- attributes = key specs/claims per brand (e.g. "gluten-free", "400mg", "third-party tested")
-- Return ONLY the JSON object, nothing else.
+Brand mention:  simple case-insensitive substring search
+Position:       detect numbered-list rank (1. / 1) / #1)
+Competitors:    extract brand-like names from numbered list items
+Attributes:     skipped (not needed for scoring; recommender uses won/lost queries)
 """
 
+from __future__ import annotations
+import re
+from models import ModelMentions, ModelPositions, ParsedQueryResult, QueryResult
 
-async def _parse_one_response(client: GenerationClient, query: str,
-                               response_text: str, brand: str) -> dict:
-    if response_text.startswith("[ERROR:"):
+# Match numbered list items:  "1. ...", "1) ...", "#1 ..."
+_LIST_RE = re.compile(
+    r'(?:^|\n)\s*(?:#\s*)?(\d+)[.)]\s+(.+?)(?=\n\s*(?:#\s*)?\d+[.)]|\Z)',
+    re.DOTALL,
+)
+# Leading brand name from a list item (Title Case or ALL CAPS run)
+_BRAND_RE = re.compile(r'^([A-Z][A-Za-z0-9&\'\-]+(?:\s+[A-Z][A-Za-z0-9&\'\-]+){0,4})')
+
+
+def _parse_response(response: str, brand: str) -> dict:
+    """Parse one LLM response string. Returns the same shape as the old LLM parser."""
+    if not response or response.startswith("[ERROR:"):
         return {"mentioned": False, "position": None, "competitors": [], "attributes": {}}
-    prompt = _PROMPT.format(query=query, response=response_text[:2000], brand=brand)
-    raw = await client.query(prompt, system=_SYSTEM)
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if match:
+
+    brand_lower = brand.lower()
+    resp_lower  = response.lower()
+    mentioned   = brand_lower in resp_lower
+
+    # Numbered list items
+    items = _LIST_RE.findall(response)   # [(num_str, text), ...]
+
+    # Brand position in numbered list
+    position: int | None = None
+    for num_str, text in items:
+        if brand_lower in text.lower():
             try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
+                position = int(num_str)
+            except ValueError:
                 pass
-    return {"mentioned": False, "position": None, "competitors": [], "attributes": {}}
+            break
+
+    # Competitor brand names from list items
+    competitors: list[str] = []
+    for _, text in items:
+        text = text.strip()
+        m = _BRAND_RE.match(text)
+        if m:
+            cand = m.group(1).strip()
+            if (cand.lower() != brand_lower
+                    and cand not in competitors
+                    and len(cand) > 2):
+                competitors.append(cand)
+
+    # Fallback: if no numbered list, pull capitalized runs (2-4 words) from text
+    if not competitors:
+        for m in re.finditer(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b', response):
+            cand = m.group(1)
+            if cand.lower() != brand_lower and cand not in competitors:
+                competitors.append(cand)
+
+    return {
+        "mentioned": mentioned,
+        "position": position,
+        "competitors": competitors[:8],
+        "attributes": {},
+    }
 
 
-def _safe_bool(val: object) -> bool:
-    if isinstance(val, bool):
-        return val
-    if isinstance(val, str):
-        return val.lower() in ("true", "yes", "1")
-    return bool(val)
+def _safe_bool(v: object) -> bool:
+    if isinstance(v, bool):
+        return v
+    return str(v).lower() in ("true", "yes", "1")
 
 
-def _safe_int(val: object) -> int | None:
-    if val is None:
+def _safe_int(v: object) -> int | None:
+    if v is None:
         return None
     try:
-        return int(val)
+        return int(v)
     except (TypeError, ValueError):
         return None
 
 
-async def parse_query_results(results: list[QueryResult], brand: str) -> list[ParsedQueryResult]:
-    client = GenerationClient()
+async def parse_query_results(
+    results: list[QueryResult], brand: str
+) -> list[ParsedQueryResult]:
+    """Synchronous text parsing wrapped in async signature for drop-in compatibility."""
+    parsed: list[ParsedQueryResult] = []
+    for qr in results:
+        gpt4_p   = _parse_response(qr.gpt4_response,   brand)
+        claude_p = _parse_response(qr.claude_response, brand)
+        gemini_p = _parse_response(qr.gemini_response, brand)
 
-    async def parse_one(qr: QueryResult) -> ParsedQueryResult:
-        gpt4_p, claude_p, gemini_p = await asyncio.gather(
-            _parse_one_response(client, qr.query, qr.gpt4_response, brand),
-            _parse_one_response(client, qr.query, qr.claude_response, brand),
-            _parse_one_response(client, qr.query, qr.gemini_response, brand),
-        )
-        all_competitors: list[str] = []
+        all_comps: list[str] = []
         for p in (gpt4_p, claude_p, gemini_p):
-            all_competitors.extend(p.get("competitors", []))
-        unique_competitors = list(dict.fromkeys(all_competitors))
+            for c in p["competitors"]:
+                if c not in all_comps:
+                    all_comps.append(c)
 
-        merged_attrs: dict[str, list[str]] = {}
-        for p in (gpt4_p, claude_p, gemini_p):
-            for b, attrs in p.get("attributes", {}).items():
-                if b not in merged_attrs:
-                    merged_attrs[b] = []
-                merged_attrs[b].extend(a for a in attrs if a not in merged_attrs[b])
-
-        return ParsedQueryResult(
+        parsed.append(ParsedQueryResult(
             query=qr.query,
             mentions=ModelMentions(
-                gpt4=_safe_bool(gpt4_p.get("mentioned")),
-                claude=_safe_bool(claude_p.get("mentioned")),
-                gemini=_safe_bool(gemini_p.get("mentioned")),
+                gpt4=_safe_bool(gpt4_p["mentioned"]),
+                claude=_safe_bool(claude_p["mentioned"]),
+                gemini=_safe_bool(gemini_p["mentioned"]),
             ),
             position=ModelPositions(
-                gpt4=_safe_int(gpt4_p.get("position")),
-                claude=_safe_int(claude_p.get("position")),
-                gemini=_safe_int(gemini_p.get("position")),
+                gpt4=_safe_int(gpt4_p["position"]),
+                claude=_safe_int(claude_p["position"]),
+                gemini=_safe_int(gemini_p["position"]),
             ),
-            competitors_mentioned=unique_competitors,
-            attributes=merged_attrs,
-        )
-
-    return list(await asyncio.gather(*[parse_one(qr) for qr in results]))
+            competitors_mentioned=all_comps,
+            attributes={},
+        ))
+    return parsed

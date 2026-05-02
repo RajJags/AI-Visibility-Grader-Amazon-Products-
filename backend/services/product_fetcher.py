@@ -173,3 +173,44 @@ async def fetch_product(raw_input: str, manual_brand: str | None = None,
     return Product(asin=asin, brand="MANUAL_ENTRY_REQUIRED",
                    title=f"Product {asin}", category=_STUB_CATEGORY,
                    bullets=[], image_url=None)
+
+
+async def fetch_product_with_llm_fallback(
+    raw_input: str,
+    manual_brand: str | None = None,
+    manual_title: str | None = None,
+) -> Product:
+    """
+    Same as fetch_product but if MANUAL_ENTRY_REQUIRED is returned,
+    asks an LLM to infer brand/title from the ASIN as a last resort.
+    Only used when the user hasn't provided manual details.
+    """
+    from llm_clients import GenerationClient
+
+    product = await fetch_product(raw_input, manual_brand, manual_title)
+    if product.brand != "MANUAL_ENTRY_REQUIRED":
+        return product
+
+    # LLM last resort: infer from ASIN
+    try:
+        client = GenerationClient()
+        asin = product.asin
+        raw = await client.query(
+            f"What Amazon product has ASIN {asin}? "
+            "Reply with exactly two lines:\nBrand: <brand name>\nTitle: <full product title>\n"
+            "If you don't know, write Unknown for both.",
+            system="You are a product database assistant. Be concise and accurate.",
+        )
+        brand, title = "Unknown Brand", f"Product {asin}"
+        for line in raw.strip().splitlines():
+            if line.lower().startswith("brand:"):
+                brand = line.split(":", 1)[1].strip()
+            elif line.lower().startswith("title:"):
+                title = line.split(":", 1)[1].strip()
+        if brand.lower() not in ("unknown", "unknown brand", ""):
+            return Product(asin=asin, brand=brand, title=title,
+                           category=_STUB_CATEGORY, bullets=[], image_url=None)
+    except Exception:
+        pass
+
+    return product  # still MANUAL_ENTRY_REQUIRED → frontend shows manual form

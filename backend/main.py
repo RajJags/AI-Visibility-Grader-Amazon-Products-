@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from models import DiagnoseRequest, DiagnoseResponse, QuerySummary
-from services.product_fetcher import fetch_product
+from services.product_fetcher import fetch_product_with_llm_fallback as fetch_product
 from services.query_generator import generate_queries
 from services.llm_runner import run_all_queries
 from services.parser import parse_query_results

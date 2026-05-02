@@ -33,7 +33,7 @@ _GROQ_SMALL = [
 ]
 
 # Max simultaneous LLM calls across all slots
-_SEM = asyncio.Semaphore(4)
+_SEM = asyncio.Semaphore(6)
 
 
 class _SlotClient:
