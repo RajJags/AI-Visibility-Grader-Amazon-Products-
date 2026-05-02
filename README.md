@@ -5,6 +5,8 @@
 AI Visibility Grader tells Amazon sellers how often ChatGPT, Claude, and Gemini recommend their brand when shoppers ask realistic buying questions. Paste an ASIN, get a 0–100 score, see exactly which queries you're losing to competitors, and receive 5 specific listing improvements — in about 60 seconds.
 
 Built as a companion to [Pixii](https://pixii.ai). Pixii grades listings for human clickability. This grades them for **AI recommendability**.
+<img width="1231" height="906" alt="image" src="https://github.com/user-attachments/assets/6ca30e99-cd07-4751-a8f1-86b1f19fb71c" />
+
 
 ---
 
