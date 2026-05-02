@@ -17,17 +17,17 @@ Brand: {brand}
 Category: {category}
 Key bullets: {bullets}
 
-Generate exactly 7 realistic buyer search queries a shopper might ask ChatGPT, Google, \
+Generate exactly 10 realistic buyer search queries a shopper might ask ChatGPT, Google, \
 or a voice assistant when looking for a product like this.
 
 Cover 3 buckets:
-- 2-3 high-intent comparison queries  (e.g. "best magnesium for sleep")
-- 2-3 problem-first queries            (e.g. "magnesium that doesn't cause stomach upset")
-- 1-2 attribute-specific queries       (e.g. "vegan magnesium glycinate 400mg")
+- 3-4 high-intent comparison queries  (e.g. "best magnesium for sleep")
+- 3-4 problem-first queries            (e.g. "magnesium that doesn't cause stomach upset")
+- 2-3 attribute-specific queries       (e.g. "vegan magnesium glycinate 400mg")
 
 Rules:
 - Each query is 3-10 words, natural language, NO brand names.
-- Return ONLY a valid JSON array of 7 strings, no explanation, no markdown.
+- Return ONLY a valid JSON array of 10 strings, no explanation, no markdown.
 
 Example: ["best magnesium supplement for sleep", "magnesium for anxiety and stress", ...]
 """
@@ -47,13 +47,13 @@ async def generate_queries(product: Product) -> list[str]:
         raw = raw.strip()
     try:
         adapter: TypeAdapter[list[str]] = TypeAdapter(list[str])
-        return adapter.validate_json(raw)[:7]
+        return adapter.validate_json(raw)[:10]
     except (json.JSONDecodeError, ValidationError):
         match = re.search(r"\[.*?\]", raw, re.DOTALL)
         if match:
             try:
-                return json.loads(match.group())[:7]
+                return json.loads(match.group())[:10]
             except json.JSONDecodeError:
                 pass
         lines = [l.strip().strip('"').strip("'") for l in raw.splitlines() if l.strip()]
-        return [l for l in lines if l][:7]
+        return [l for l in lines if l][
