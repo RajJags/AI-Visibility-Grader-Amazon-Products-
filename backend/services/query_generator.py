@@ -33,27 +33,60 @@ Example: ["best magnesium supplement for sleep", "magnesium for anxiety and stre
 """
 
 
+def _parse_queries(raw: str) -> list[str]:
+    """Extract a list of query strings from raw LLM output."""
+    raw = raw.strip()
+    # Strip thinking tags
+    raw = re.sub(r"<think(?:ing)?>[^<]*?</think(?:ing)?>", "", raw, flags=re.DOTALL).strip()
+    # Strip markdown fences
+    if "```" in raw:
+        parts = raw.split("```")
+        for part in parts:
+            part = part.strip()
+            if part.startswith("json"):
+                part = part[4:].strip()
+            if part.startswith("["):
+                raw = part
+                break
+    # Try direct JSON parse
+    try:
+        adapter: TypeAdapter[list[str]] = TypeAdapter(list[str])
+        return adapter.validate_json(raw)[:10]
+    except (json.JSONDecodeError, ValidationError):
+        pass
+    # Greedy regex to find the full array (non-greedy \[.*?\] stops at first ])
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())[:10]
+        except json.JSONDecodeError:
+            pass
+    # Line-based fallback — strip numbering/bullets
+    lines = []
+    for line in raw.splitlines():
+        line = line.strip()
+        line = re.sub(r"^[\d]+[\.\)]\s*", "", line)   # "1. " or "1) "
+        line = re.sub(r'^[-*•]\s*', "", line)          # "- " or "* "
+        line = line.strip('"\'')
+        if len(line) > 5:
+            lines.append(line)
+    return lines[:10]
+
+
 async def generate_queries(product: Product) -> list[str]:
     client = GenerationClient()
     bullets_text = " | ".join(product.bullets[:5]) if product.bullets else "N/A"
     prompt = _PROMPT.format(title=product.title, brand=product.brand,
                             category=product.category, bullets=bullets_text)
-    raw = await client.query(prompt, system=_SYSTEM)
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-    try:
-        adapter: TypeAdapter[list[str]] = TypeAdapter(list[str])
-        return adapter.validate_json(raw)[:10]
-    except (json.JSONDecodeError, ValidationError):
-        match = re.search(r"\[.*?\]", raw, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())[:10]
-            except json.JSONDecodeError:
-                pass
-        lines = [l.strip().strip('"').strip("'") for l in raw.splitlines() if l.strip()]
-        return [l for l in lines if l][
+
+    for attempt in range(2):
+        raw = await client.query(prompt, system=_SYSTEM)
+        queries = _parse_queries(raw)
+        if len(queries) >= 8:
+            return queries[:10]
+        # LLM returned too few — retry once with a firmer nudge
+        if attempt == 0:
+            prompt = prompt + "\n\nIMPORTANT: You must return exactly 10 items in the JSON array."
+
+    # Return whatever we got (even if < 10)
+    return queries[:10] if queries else []

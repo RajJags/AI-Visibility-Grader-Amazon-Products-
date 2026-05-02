@@ -1,9 +1,8 @@
 """
-ResponseParser — batched LLM parsing.
+ResponseParser -- batched LLM parsing.
 
-One LLM call per query (parsing all 3 model responses together) instead of
-3 separate calls. Reduces parser LLM calls from 30 → 10, cutting parse time
-by ~65% while keeping extraction quality identical to the original.
+One LLM call parses all 3 model responses per query.
+10 total calls for 10 queries (vs 30 in the original).
 """
 
 from __future__ import annotations
@@ -11,13 +10,17 @@ import asyncio, json, re
 from llm_clients import GenerationClient
 from models import ModelMentions, ModelPositions, ParsedQueryResult, QueryResult
 
-_SYSTEM = "You are a structured data extraction assistant. Always respond with valid JSON only."
+_SYSTEM = "You are a structured data extraction assistant. Always respond with valid JSON only, no markdown, no explanation."
 
 _BATCH_PROMPT = """\
 Shopping query: "{query}"
 Target brand: "{brand}"
 
-Parse brand mentions in these 3 AI shopping assistant responses:
+Three AI shopping assistant responses are shown below. For each one, extract:
+- mentioned: true if the target brand appears as a recommendation
+- position: 1-indexed rank in the numbered list (null if not in a ranked list)
+- competitors: list of OTHER real brand names recommended (not the target brand, not generic phrases)
+- attributes: key specs or features mentioned per brand (e.g. "inverter", "5-star", "copper coil")
 
 RESPONSE_A:
 {response_a}
@@ -28,27 +31,24 @@ RESPONSE_B:
 RESPONSE_C:
 {response_c}
 
-Return ONLY this JSON (no markdown, no explanation):
+Return ONLY this JSON:
 {{
-  "a": {{"mentioned": true/false, "position": null/integer, "competitors": ["Brand X", ...], "attributes": {{"Brand X": ["attr1"]}}}},
-  "b": {{"mentioned": true/false, "position": null/integer, "competitors": ["Brand X", ...], "attributes": {{}}}},
-  "c": {{"mentioned": true/false, "position": null/integer, "competitors": ["Brand X", ...], "attributes": {{}}}}
+  "a": {{"mentioned": true/false, "position": null/1/2/3, "competitors": ["Brand X", ...], "attributes": {{"Brand X": ["attr1", "attr2"]}}}},
+  "b": {{"mentioned": true/false, "position": null/1/2/3, "competitors": ["Brand X", ...], "attributes": {{}}}},
+  "c": {{"mentioned": true/false, "position": null/1/2/3, "competitors": ["Brand X", ...], "attributes": {{}}}}
 }}
-
-Rules:
-- position: 1-indexed rank in the numbered list (null if brand not mentioned)
-- competitors: real brand/product names only — NOT generic phrases, categories, or attributes
-- attributes: key specs or claims per brand (e.g. "5-star rating", "copper coil", "inverter")
 """
 
 
-def _extract_json(raw: str) -> dict:
+def _extract_json(raw):
     raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
+    raw = re.sub(r"<think(?:ing)?>.*?</think(?:ing)?>", "", raw, flags=re.DOTALL).strip()
+    if "```" in raw:
+        for part in raw.split("```"):
+            part = part.strip().lstrip("json").strip()
+            if part.startswith("{"):
+                raw = part
+                break
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
@@ -64,13 +64,13 @@ def _extract_json(raw: str) -> dict:
 _EMPTY = {"mentioned": False, "position": None, "competitors": [], "attributes": {}}
 
 
-def _safe_bool(v: object) -> bool:
+def _safe_bool(v):
     if isinstance(v, bool):
         return v
     return str(v).lower() in ("true", "yes", "1")
 
 
-def _safe_int(v: object) -> int | None:
+def _safe_int(v):
     if v is None:
         return None
     try:
@@ -79,14 +79,10 @@ def _safe_int(v: object) -> int | None:
         return None
 
 
-async def _parse_one_query(
-    client: GenerationClient, qr: QueryResult, brand: str
-) -> ParsedQueryResult:
-    """One LLM call parses all 3 model responses for this query."""
-    is_error = lambda r: not r or r.startswith("[ERROR:")
+async def _parse_one(client, qr, brand):
+    is_err = lambda r: not r or r.startswith("[ERROR:")
 
-    # If all responses errored, skip LLM entirely
-    if all(is_error(r) for r in [qr.gpt4_response, qr.claude_response, qr.gemini_response]):
+    if all(is_err(r) for r in [qr.gpt4_response, qr.claude_response, qr.gemini_response]):
         return ParsedQueryResult(
             query=qr.query,
             mentions=ModelMentions(gpt4=False, claude=False, gemini=False),
@@ -95,10 +91,11 @@ async def _parse_one_query(
         )
 
     prompt = _BATCH_PROMPT.format(
-        query=qr.query, brand=brand,
-        response_a=qr.gpt4_response[:1500]   if not is_error(qr.gpt4_response)   else "(no response)",
-        response_b=qr.claude_response[:1500]  if not is_error(qr.claude_response)  else "(no response)",
-        response_c=qr.gemini_response[:1500]  if not is_error(qr.gemini_response)  else "(no response)",
+        query=qr.query,
+        brand=brand,
+        response_a=qr.gpt4_response[:1500]   if not is_err(qr.gpt4_response)   else "(no response)",
+        response_b=qr.claude_response[:1500]  if not is_err(qr.claude_response)  else "(no response)",
+        response_c=qr.gemini_response[:1500]  if not is_err(qr.gemini_response)  else "(no response)",
     )
 
     raw = await client.query(prompt, system=_SYSTEM)
@@ -107,20 +104,22 @@ async def _parse_one_query(
     b = data.get("b", _EMPTY)
     c = data.get("c", _EMPTY)
 
-    all_competitors: list[str] = []
-    for p in (a, b, c):
-        for comp in p.get("competitors", []):
-            if comp not in all_competitors:
-                all_competitors.append(comp)
+    all_comps = []
+    seen = set()
+    for slot in (a, b, c):
+        for comp in slot.get("competitors", []):
+            if isinstance(comp, str) and comp.lower() not in seen:
+                seen.add(comp.lower())
+                all_comps.append(comp)
 
-    merged_attrs: dict[str, list[str]] = {}
-    for p in (a, b, c):
-        for brand_key, attrs in p.get("attributes", {}).items():
-            if brand_key not in merged_attrs:
-                merged_attrs[brand_key] = []
-            merged_attrs[brand_key].extend(
-                attr for attr in attrs if attr not in merged_attrs[brand_key]
-            )
+    merged_attrs = {}
+    for slot in (a, b, c):
+        for bk, attrs in slot.get("attributes", {}).items():
+            if bk not in merged_attrs:
+                merged_attrs[bk] = []
+            for attr in attrs:
+                if attr not in merged_attrs[bk]:
+                    merged_attrs[bk].append(attr)
 
     return ParsedQueryResult(
         query=qr.query,
@@ -134,15 +133,11 @@ async def _parse_one_query(
             claude=_safe_int(b.get("position")),
             gemini=_safe_int(c.get("position")),
         ),
-        competitors_mentioned=all_competitors,
+        competitors_mentioned=all_comps[:8],
         attributes=merged_attrs,
     )
 
 
-async def parse_query_results(
-    results: list[QueryResult], brand: str
-) -> list[ParsedQueryResult]:
+async def parse_query_results(results, brand):
     client = GenerationClient()
-    return list(await asyncio.gather(
-        *[_parse_one_query(client, qr, brand) for qr in results]
-    ))
+    return list(await asyncio.gather(*[_parse_one(client, qr, brand) for qr in results]))
