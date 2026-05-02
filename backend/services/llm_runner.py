@@ -1,9 +1,9 @@
 """
-LLMRunner — three scoring slots, each with its own Groq model list + Gemini fallback.
+LLMRunner — three scoring slots with concurrency control.
 
-Slot A (gpt4)   → 70B-class models  (llama-3.3-70b, gpt-oss-120b, qwen3-32b)
-Slot B (claude) → 8-20B-class       (llama-3.1-8b,  gpt-oss-20b,  llama4-scout)
-Slot C (gemini) → Gemini first, then Groq fallback
+Semaphore limits to 4 simultaneous LLM calls so we don't blast through
+Groq's 6,000 TPM free-tier limit with 30 parallel requests.
+Slots are staggered slightly to spread the token load over time.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ _GROQ_LARGE = [
     "openai/gpt-oss-120b",
     "qwen/qwen3-32b",
     "meta-llama/llama-4-scout-17b-16e-instruct",
-    "llama-3.1-8b-instant",          # last-resort within slot
+    "llama-3.1-8b-instant",
 ]
 _GROQ_SMALL = [
     "llama-3.1-8b-instant",
@@ -32,17 +32,11 @@ _GROQ_SMALL = [
     "qwen/qwen3-32b",
 ]
 
-
-async def _query_safe(client, query: str) -> str:
-    try:
-        return await client.query(query, system=_SYSTEM)
-    except Exception as exc:
-        return f"[ERROR: {exc}]"
+# Max simultaneous LLM calls across all slots
+_SEM = asyncio.Semaphore(4)
 
 
 class _SlotClient:
-    """Primary provider list → OpenRouter free fallback → Gemini fallback."""
-
     def __init__(self, groq_models: list[str], gemini_first: bool = False):
         self._groq = GroqClient(models=groq_models)
         self._or   = OpenRouterClient()
@@ -55,7 +49,7 @@ class _SlotClient:
             if self._gemini_first
             else [self._groq, self._or, self._gem]
         )
-        last: Exception = RuntimeError("no providers configured")
+        last: Exception = RuntimeError("no providers")
         for p in providers:
             try:
                 return await p.query(prompt, system=system)
@@ -64,17 +58,31 @@ class _SlotClient:
         raise last
 
 
+async def _query_safe(client: _SlotClient, query: str, delay: float = 0.0) -> str:
+    if delay:
+        await asyncio.sleep(delay)
+    async with _SEM:
+        try:
+            return await client.query(query, system=_SYSTEM)
+        except Exception as exc:
+            return f"[ERROR: {exc}]"
+
+
 async def run_all_queries(queries: list[str]) -> list[QueryResult]:
-    slot_a = _SlotClient(_GROQ_LARGE, gemini_first=False)   # "gpt4" slot
-    slot_b = _SlotClient(_GROQ_SMALL, gemini_first=False)   # "claude" slot
-    slot_c = _SlotClient(_GROQ_SMALL, gemini_first=True)    # "gemini" slot
+    slot_a = _SlotClient(_GROQ_LARGE, gemini_first=False)
+    slot_b = _SlotClient(_GROQ_SMALL, gemini_first=False)
+    slot_c = _SlotClient(_GROQ_SMALL, gemini_first=True)
 
     n = len(queries)
-    all_responses = await asyncio.gather(
-        *[_query_safe(slot_a, q) for q in queries],
-        *[_query_safe(slot_b, q) for q in queries],
-        *[_query_safe(slot_c, q) for q in queries],
+
+    # Stagger slots: slot B starts 1s later, slot C starts 2s later
+    # so we don't hit 30 concurrent requests at t=0
+    tasks = (
+        [_query_safe(slot_a, q, delay=0.0)         for q in queries] +
+        [_query_safe(slot_b, q, delay=1.0)         for q in queries] +
+        [_query_safe(slot_c, q, delay=2.0)         for q in queries]
     )
+    all_responses = await asyncio.gather(*tasks)
 
     return [
         QueryResult(

@@ -16,7 +16,6 @@ OPENROUTER_FREE_MODELS = [
     "mistralai/mistral-7b-instruct:free",
     "google/gemma-2-9b-it:free",
     "qwen/qwen-2-7b-instruct:free",
-    "microsoft/phi-3-mini-128k-instruct:free",
 ]
 
 

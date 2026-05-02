@@ -1,15 +1,21 @@
 """
-GenerationClient — exhaustive free-tier fallback chain.
+GenerationClient — exhaustive free-tier fallback chain with concurrency cap.
 
-Order: Groq (7 models) → OpenRouter (5 free models) → Gemini (4 models).
-Each provider walks its own model list before handing off to the next.
+A module-level semaphore (shared with llm_runner) caps total concurrent LLM
+calls at 4 so we don't burst through Groq's 6,000 TPM free-tier limit.
+
+Order: Groq → OpenRouter → Gemini
 """
 
 from __future__ import annotations
+import asyncio
 from .groq_client import GroqClient
 from .openrouter_client import OpenRouterClient
 from .gemini_client import GeminiClient
 from .base import BaseLLMClient
+
+# Shared cap: no more than 4 LLM calls in flight at once across the whole app
+_SEM = asyncio.Semaphore(4)
 
 
 class GenerationClient(BaseLLMClient):
@@ -19,9 +25,12 @@ class GenerationClient(BaseLLMClient):
         self._gemini: GeminiClient | None = None
 
     async def query(self, prompt: str, system: str = "") -> str:
+        async with _SEM:
+            return await self._query_inner(prompt, system)
+
+    async def _query_inner(self, prompt: str, system: str) -> str:
         errors: list[str] = []
 
-        # 1. Groq — llama-3.1-8b → gemma2-9b → mixtral → llama-70b variants
         try:
             if self._groq is None:
                 self._groq = GroqClient()
@@ -29,7 +38,6 @@ class GenerationClient(BaseLLMClient):
         except Exception as e:
             errors.append(f"Groq: {e}")
 
-        # 2. OpenRouter — 5 permanently free models (no daily reset)
         try:
             if self._openrouter is None:
                 self._openrouter = OpenRouterClient()
@@ -37,7 +45,6 @@ class GenerationClient(BaseLLMClient):
         except Exception as e:
             errors.append(f"OpenRouter: {e}")
 
-        # 3. Gemini — flash-8b → flash → 2.0-flash → 2.0-flash-lite
         try:
             if self._gemini is None:
                 self._gemini = GeminiClient()
