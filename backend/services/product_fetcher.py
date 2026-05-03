@@ -93,7 +93,13 @@ async def _scrape_amazon(asin: str) -> Product | None:
     except Exception:
         return None
 
-    soup = BeautifulSoup(html, "lxml")
+    # lxml is faster but not always available; fall back to built-in html.parser
+    _parser = "lxml"
+    try:
+        import lxml  # noqa: F401
+    except ImportError:
+        _parser = "html.parser"
+    soup = BeautifulSoup(html, _parser)
     title_el = soup.select_one("#productTitle")
     title = title_el.get_text(strip=True) if title_el else ""
     if not title:
