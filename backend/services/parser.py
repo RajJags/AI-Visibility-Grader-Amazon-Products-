@@ -63,6 +63,10 @@ def _extract_json(raw):
 _EMPTY = {"mentioned": False, "position": None, "competitors": [], "attributes": {}}
 
 
+def _safe_slot(value):
+    return value if isinstance(value, dict) else _EMPTY
+
+
 def _safe_bool(v):
     if isinstance(v, bool):
         return v
@@ -76,6 +80,14 @@ def _safe_int(v):
         return int(v)
     except (TypeError, ValueError):
         return None
+
+
+def _safe_list(value):
+    return value if isinstance(value, list) else []
+
+
+def _safe_attrs(value):
+    return value if isinstance(value, dict) else {}
 
 
 async def _parse_one(client, qr, brand):
@@ -99,25 +111,29 @@ async def _parse_one(client, qr, brand):
 
     raw = await client.query(prompt, system=_SYSTEM)
     data = _extract_json(raw)
-    a = data.get("a", _EMPTY)
-    b = data.get("b", _EMPTY)
-    c = data.get("c", _EMPTY)
+    if not isinstance(data, dict):
+        data = {}
+    a = _safe_slot(data.get("a"))
+    b = _safe_slot(data.get("b"))
+    c = _safe_slot(data.get("c"))
 
     all_comps = []
     seen = set()
     for slot in (a, b, c):
-        for comp in slot.get("competitors", []):
+        for comp in _safe_list(slot.get("competitors")):
             if isinstance(comp, str) and comp.lower() not in seen:
                 seen.add(comp.lower())
                 all_comps.append(comp)
 
     merged_attrs = {}
     for slot in (a, b, c):
-        for bk, attrs in slot.get("attributes", {}).items():
+        for bk, attrs in _safe_attrs(slot.get("attributes")).items():
+            if not isinstance(bk, str):
+                continue
             if bk not in merged_attrs:
                 merged_attrs[bk] = []
-            for attr in attrs:
-                if attr not in merged_attrs[bk]:
+            for attr in _safe_list(attrs):
+                if isinstance(attr, str) and attr not in merged_attrs[bk]:
                     merged_attrs[bk].append(attr)
 
     return ParsedQueryResult(
