@@ -64,10 +64,15 @@ class Recommendation(BaseModel):
 
 
 class DiagnoseRequest(BaseModel):
-    asin: str = Field(..., min_length=1)
+    # asin is optional -- frontend now submits brand+title directly
+    asin: Optional[str] = Field(default=None)
     brand: Optional[str] = None
     title: Optional[str] = None
     category: Optional[str] = None
+
+    @property
+    def has_product_info(self) -> bool:
+        return bool(self.brand and self.title)
 
 
 class QuerySummary(BaseModel):

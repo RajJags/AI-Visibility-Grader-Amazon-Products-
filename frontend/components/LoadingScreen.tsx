@@ -5,22 +5,22 @@ import { useState, useEffect } from "react";
 interface Step {
   id: string;
   label: string;
-  activeAt: number;   // seconds elapsed before this step activates
-  doneAt: number;     // seconds elapsed before this step shows ✓ (Infinity = stays active)
+  activeAt: number;
+  doneAt: number;
 }
 
 const STEPS: Step[] = [
-  { id: "product",  label: "Fetching product data",               activeAt: 0,  doneAt: 4   },
-  { id: "queries",  label: "Generating 10 buyer queries",          activeAt: 4,  doneAt: 14  },
-  { id: "llm-a",   label: "Querying Llama 3.3 (70B)",             activeAt: 14, doneAt: 62  },
-  { id: "llm-b",   label: "Querying Llama 3.1 (8B)",              activeAt: 14, doneAt: 62  },
-  { id: "llm-c",   label: "Querying Gemini",                      activeAt: 14, doneAt: 62  },
-  { id: "parse",   label: "Parsing responses with AI",            activeAt: 62, doneAt: 76  },
-  { id: "score",   label: "Scoring responses",                    activeAt: 76, doneAt: 80  },
-  { id: "recs",    label: "Generating recommendations",           activeAt: 80, doneAt: Infinity },
+  { id: "setup",   label: "Setting up product profile",    activeAt: 0,  doneAt: 4   },
+  { id: "queries", label: "Generating 10 buyer queries",   activeAt: 4,  doneAt: 14  },
+  { id: "llm-a",  label: "Querying Llama 3.3 (70B)",      activeAt: 14, doneAt: 62  },
+  { id: "llm-b",  label: "Querying Llama 3.1 (8B)",       activeAt: 14, doneAt: 62  },
+  { id: "llm-c",  label: "Querying Gemini",                activeAt: 14, doneAt: 62  },
+  { id: "parse",  label: "Parsing responses with AI",      activeAt: 62, doneAt: 76  },
+  { id: "score",  label: "Scoring responses",              activeAt: 76, doneAt: 80  },
+  { id: "recs",   label: "Generating recommendations",     activeAt: 80, doneAt: Infinity },
 ];
 
-const ESTIMATED_TOTAL = 90; // seconds
+const ESTIMATED_TOTAL = 110;
 
 type StepStatus = "pending" | "active" | "done";
 
@@ -30,7 +30,7 @@ function getStatus(step: Step, elapsed: number): StepStatus {
   return "pending";
 }
 
-export default function LoadingScreen({ asin }: { asin?: string }) {
+export default function LoadingScreen({ productName }: { productName?: string }) {
   const [elapsed, setElapsed] = useState(0);
 
   useEffect(() => {
@@ -47,10 +47,8 @@ export default function LoadingScreen({ asin }: { asin?: string }) {
         <p className="text-xs font-semibold uppercase tracking-widest text-neutral-400 mb-3">
           Running diagnostic
         </p>
-        {asin && (
-          <p className="text-sm text-neutral-500 font-mono truncate">
-            ASIN: {asin}
-          </p>
+        {productName && (
+          <p className="text-sm text-neutral-500 truncate">{productName}</p>
         )}
       </div>
 
@@ -60,7 +58,6 @@ export default function LoadingScreen({ asin }: { asin?: string }) {
           const status = getStatus(step, elapsed);
           return (
             <div key={step.id} className="flex items-center gap-3">
-              {/* Icon */}
               <div className="w-5 flex items-center justify-center flex-shrink-0">
                 {status === "done" && (
                   <svg className="w-4 h-4 text-score-high" viewBox="0 0 16 16" fill="none">
@@ -73,12 +70,10 @@ export default function LoadingScreen({ asin }: { asin?: string }) {
                   <span className="w-3 h-3 rounded-full border border-neutral-300 inline-block" />
                 )}
               </div>
-
-              {/* Label */}
               <span className={
-                status === "done"    ? "text-sm text-neutral-400 line-through" :
-                status === "active"  ? "text-sm text-neutral-900 font-medium" :
-                                       "text-sm text-neutral-400"
+                status === "done"   ? "text-sm text-neutral-400 line-through" :
+                status === "active" ? "text-sm text-neutral-900 font-medium"  :
+                                      "text-sm text-neutral-400"
               }>
                 {step.label}
               </span>
@@ -100,7 +95,7 @@ export default function LoadingScreen({ asin }: { asin?: string }) {
           />
         </div>
         <p className="text-xs text-neutral-400 mt-3 text-center">
-          Usually 30–60 seconds depending on AI model load.
+          Usually 90&ndash;120 seconds depending on AI model load.
         </p>
       </div>
     </main>

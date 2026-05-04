@@ -1,14 +1,14 @@
 """
-GenerationClient — smart free-tier LLM with circuit breaker.
+GenerationClient -- smart free-tier LLM with circuit breaker.
 
 Provider order per request:
-  1. Build provider list ordered by health (healthy → degraded → failed).
+  1. Build provider list ordered by health (healthy -> degraded -> failed).
   2. Try each provider in order; skip instantly if it raised a non-transient
      error recently (circuit breaker via _health module).
   3. A shared semaphore caps total in-flight LLM calls so we don't burst
      through Groq's TPM limit across parallel parse/recommend/generate calls.
 
-Providers: Groq → OpenRouter → Gemini (default order when all healthy).
+Providers: Groq -> OpenRouter -> Gemini (default order when all healthy).
 """
 
 from __future__ import annotations
@@ -28,22 +28,6 @@ _GEM_KEY  = "provider:gemini"
 _SEM = asyncio.Semaphore(4)
 
 
-def _ordered_providers(
-    groq: GroqClient,
-    openrouter: OpenRouterClient,
-    gemini: GeminiClient,
-) -> list[tuple[str, object]]:
-    """Return providers sorted: healthy first, recently-failed last."""
-    all_providers = [
-        (_GROQ_KEY, groq),
-        (_OR_KEY,   openrouter),
-        (_GEM_KEY,  gemini),
-    ]
-    healthy  = [(k, p) for k, p in all_providers if health.is_healthy(k)]
-    degraded = [(k, p) for k, p in all_providers if not health.is_healthy(k)]
-    return healthy + degraded
-
-
 class GenerationClient(BaseLLMClient):
     """
     Single LLM client for non-scoring work (query generation, parsing,
@@ -56,7 +40,7 @@ class GenerationClient(BaseLLMClient):
         self._openrouter: OpenRouterClient | None = None
         self._gemini: GeminiClient | None = None
 
-    def _ensure_clients(self) -> tuple[GroqClient, OpenRouterClient, GeminiClient]:
+    def _ensure_clients(self) -> tuple:
         if self._groq is None:
             try:
                 self._groq = GroqClient()
@@ -72,13 +56,13 @@ class GenerationClient(BaseLLMClient):
                 self._gemini = GeminiClient()
             except RuntimeError:
                 pass
-        return self._groq, self._openrouter, self._gemini  # type: ignore[return-value]
+        return self._groq, self._openrouter, self._gemini
 
-    async def query(self, prompt: str, system: str = "") -> str:
+    async def query(self, prompt: str, system: str = "", max_tokens: int = 1024) -> str:
         async with _SEM:
-            return await self._query_inner(prompt, system)
+            return await self._query_inner(prompt, system, max_tokens)
 
-    async def _query_inner(self, prompt: str, system: str) -> str:
+    async def _query_inner(self, prompt: str, system: str, max_tokens: int = 1024) -> str:
         groq, openrouter, gemini = self._ensure_clients()
 
         available = []
@@ -101,7 +85,7 @@ class GenerationClient(BaseLLMClient):
         errors: list[str] = []
         for key, provider in ordered:
             try:
-                result = await provider.query(prompt, system=system)
+                result = await provider.query(prompt, system=system, max_tokens=max_tokens)
                 health.mark_ok(key)
                 return result
             except Exception as exc:

@@ -1,5 +1,5 @@
 """
-GeminiClient — Google Gemini free tier with circuit breaker.
+GeminiClient - Google Gemini free tier with circuit breaker.
 
 Walks GEMINI_MODELS in order (highest free-quota first).
 Failed models are deprioritised via the shared health tracker.
@@ -12,13 +12,11 @@ from .base import BaseLLMClient
 from . import _health as health
 
 GEMINI_MODELS = [
-    "gemini-1.5-flash-8b",   # 1 500 RPD free — smallest, most available
-    "gemini-1.5-flash",      # 1 500 RPD free — better quality
-    "gemini-2.0-flash",      # 1 500 RPD free — newest
-    "gemini-2.0-flash-lite", # higher RPD     — lightweight alias
+    "gemini-1.5-flash-8b",   # 1500 RPD free - smallest, most available
+    "gemini-1.5-flash",      # 1500 RPD free - better quality
+    "gemini-2.0-flash",      # 1500 RPD free - newest
+    "gemini-2.0-flash-lite", # higher RPD    - lightweight alias
 ]
-
-_GEMINI_KEY = "gemini"  # provider-level health key
 
 
 class GeminiClient(BaseLLMClient):
@@ -29,7 +27,7 @@ class GeminiClient(BaseLLMClient):
         genai.configure(api_key=api_key)
         self._models = GEMINI_MODELS
 
-    async def query(self, prompt: str, system: str = "") -> str:
+    async def query(self, prompt: str, system: str = "", max_tokens: int = 1024) -> str:
         full_prompt = f"{system}\n\n{prompt}".strip() if system else prompt
         ordered = health.best_first(self._models)
 

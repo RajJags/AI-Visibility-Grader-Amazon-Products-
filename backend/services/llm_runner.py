@@ -1,5 +1,5 @@
 """
-LLMRunner — three scoring slots with concurrency control.
+LLMRunner  -  three scoring slots with concurrency control.
 
 Semaphore limits to 4 simultaneous LLM calls so we don't blast through
 Groq's 6,000 TPM free-tier limit with 30 parallel requests.
@@ -15,7 +15,7 @@ from models import QueryResult
 _SYSTEM = (
     "You are a helpful shopping assistant. "
     "Recommend 3-5 specific products by brand name with brief reasoning. "
-    "Be direct and specific — name the actual brands and products."
+    "Be direct and specific  -  name the actual brands and products."
 )
 
 _GROQ_LARGE = [

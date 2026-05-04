@@ -46,9 +46,21 @@ async def health():
 
 @app.post("/diagnose", response_model=DiagnoseResponse)
 async def diagnose(request: DiagnoseRequest):
-    # 1. Product
-    product = await fetch_product(request.asin, manual_brand=request.brand,
-                                  manual_title=request.title)
+    # Require at least brand+title or a resolvable asin
+    if not request.has_product_info and not request.asin:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide either (brand + title) or an Amazon ASIN.",
+        )
+
+    # 1. Product -- direct brand+title bypasses all fetching
+    product = await fetch_product(
+        request.asin or request.title or "manual",
+        manual_brand=request.brand,
+        manual_title=request.title,
+    )
+
+    # Allow caller to override the category if product fetch used the default
     if request.category and product.category == "Health & Household":
         product = product.model_copy(update={"category": request.category})
 
@@ -57,7 +69,7 @@ async def diagnose(request: DiagnoseRequest):
             status_code=422,
             detail=(
                 f"Could not resolve '{request.asin}' to a product. "
-                "Re-submit with 'brand' and 'title' fields to bypass product lookup."
+                "Re-submit with 'brand' and 'title' fields."
             ),
         )
 
@@ -73,7 +85,7 @@ async def diagnose(request: DiagnoseRequest):
     parsed_results = await parse_query_results(query_results, product.brand)
 
     # 5. Score
-    score = compute_score(parsed_results)
+    score = compute_score(parsed_results, product.brand)
 
     # 6. Recommendations
     recommendations = await generate_recommendations(product, parsed_results, score)

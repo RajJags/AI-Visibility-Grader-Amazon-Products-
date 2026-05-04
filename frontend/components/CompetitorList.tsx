@@ -10,13 +10,12 @@ interface CompetitorListProps {
 export default function CompetitorList({ competitors, totalQueries }: CompetitorListProps) {
   if (!competitors.length) return null;
 
-  const maxCount = competitors[0]?.mention_count ?? 1;
-
+  
   return (
     <div className="border border-neutral-200 rounded-xl p-8">
       <div className="flex flex-col gap-5">
         {competitors.map((c, i) => {
-          const barPct = Math.round((c.mention_count / maxCount) * 100);
+          const barPct = Math.round((c.mention_count / Math.max(totalQueries, 1)) * 100);
           return (
             <div key={c.brand} className="flex items-center gap-4">
               <span className="text-xs font-mono text-neutral-400 w-4 flex-shrink-0 text-right">

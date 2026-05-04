@@ -1,8 +1,8 @@
 """
-ProductFetcher — resolves an ASIN to a Product.
+ProductFetcher  -  resolves an ASIN to a Product.
 
 Resolution order:
-  1. Rainforest API  (if RAINFOREST_API_KEY is set — reliable on any server)
+  1. Rainforest API  (if RAINFOREST_API_KEY is set  -  reliable on any server)
   2. Amazon page scrape  (works locally; often blocked on cloud IPs)
   3. Stub → frontend shows manual-entry form (HTTP 422)
 
@@ -145,16 +145,103 @@ async def _scrape_amazon(asin: str) -> Product | None:
                    bullets=bullets[:10], image_url=image_url)
 
 
+
+
+async def _try_rainforest_search(brand: str, title: str) -> Product | None:
+    """Use Rainforest search endpoint to find the best-matching product."""
+    api_key = os.environ.get('RAINFOREST_API_KEY', '')
+    if not api_key:
+        return None
+    try:
+        loop = asyncio.get_event_loop()
+        def _call():
+            params = {
+                'api_key': api_key,
+                'type': 'search',
+                'amazon_domain': 'amazon.com',
+                'search_term': f'{brand} {title}',
+            }
+            with httpx.Client(timeout=12) as client:
+                resp = client.get('https://api.rainforestapi.com/request', params=params)
+                resp.raise_for_status()
+                return resp.json()
+        data = await loop.run_in_executor(None, _call)
+        results = data.get('search_results', [])
+        if not results:
+            return None
+        top = results[0]
+        asin = top.get('asin', '')
+        if not asin:
+            return None
+        # Now fetch the full product page
+        return await _try_rainforest(asin)
+    except Exception:
+        return None
+
+# ── Amazon search by brand+title ──────────────────────────────────────────────
+
+async def _search_and_fetch(brand: str, title: str) -> Product | None:
+    """Search Amazon for brand+title, extract the first ASIN, then scrape it."""
+    query = f"{brand} {title}".strip()
+    url = "https://www.amazon.com/s?k=" + query.replace(" ", "+")
+    headers = {
+        "User-Agent": _USER_AGENTS[hash(query) % len(_USER_AGENTS)],
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    }
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=8, headers=headers) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return None
+            html = resp.text
+    except Exception:
+        return None
+
+    _parser = "lxml"
+    try:
+        import lxml  # noqa: F401
+    except ImportError:
+        _parser = "html.parser"
+    soup = BeautifulSoup(html, _parser)
+
+    # Extract first search result ASIN from data-asin attribute
+    asin = None
+    for el in soup.select("[data-asin]"):
+        val = el.get("data-asin", "")
+        if val and re.fullmatch(r"[A-Z0-9]{10}", val):
+            asin = val
+            break
+
+    if not asin:
+        return None
+
+    # Scrape the product page for the real title, bullets, category, image
+    product = await _scrape_amazon(asin)
+    return product
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
 async def fetch_product(raw_input: str, manual_brand: str | None = None,
                         manual_title: str | None = None) -> Product:
-    # Manual override — skip all fetching
+    # Brand+title provided: try to find the real Amazon listing first.
+    # This gives us real bullets, category, image, and canonical title.
+    # Fall back to a stub product if the search/scrape fails or is blocked.
     if manual_brand and manual_title:
+        found = None
+        if not _IS_CLOUD:
+            # Local env: try Amazon search scrape (usually works)
+            found = await _search_and_fetch(manual_brand, manual_title)
+        if not found and bool(os.environ.get("RAINFOREST_API_KEY", "")):
+            # Cloud with Rainforest: use their search endpoint
+            found = await _try_rainforest_search(manual_brand, manual_title)
+        if found:
+            return found
+        # Fallback: stub with the user-provided data
         try:
             asin = _extract_asin(raw_input)
         except ValueError:
-            asin = raw_input
+            asin = raw_input or "manual"
         return Product(asin=asin, brand=manual_brand, title=manual_title,
                        category=_STUB_CATEGORY, bullets=[], image_url=None)
 
@@ -166,12 +253,14 @@ async def fetch_product(raw_input: str, manual_brand: str | None = None,
                        bullets=[], image_url=None)
 
     # Rainforest first whenever the key is set (reliable on all environments).
-    # Fall back to Amazon scrape only if Rainforest is unavailable/fails.
+    # On cloud without a Rainforest key, skip scraping entirely  -  Amazon blocks
+    # cloud IP ranges almost immediately, so the 10-second timeout is dead time.
+    # Return MANUAL_ENTRY_REQUIRED instantly; the frontend shows the entry form.
     has_rainforest = bool(os.environ.get("RAINFOREST_API_KEY", ""))
     if has_rainforest:
         product = await _try_rainforest(asin) or await _scrape_amazon(asin)
     elif _IS_CLOUD:
-        product = await _scrape_amazon(asin)  # last resort on cloud without key
+        product = None  # scrape always blocked on cloud IPs; skip straight to manual form
     else:
         scraped = await _scrape_amazon(asin)
         product = scraped if (scraped and scraped.brand != "Unknown Brand") else None
@@ -192,7 +281,7 @@ async def fetch_product_with_llm_fallback(
 ) -> Product:
     """
     Thin wrapper kept for API compatibility.
-    LLM ASIN guessing was removed — it hallucinated products.
+    LLM ASIN guessing was removed  -  it hallucinated products.
     If scraping + Rainforest both fail, returns MANUAL_ENTRY_REQUIRED
     so the frontend can show the manual-entry form.
     """

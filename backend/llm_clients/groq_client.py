@@ -30,7 +30,7 @@ class GroqClient(BaseLLMClient):
         )
         self._models = models or GROQ_MODELS
 
-    async def query(self, prompt, system=""):
+    async def query(self, prompt, system="", max_tokens=1024):
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -41,7 +41,7 @@ class GroqClient(BaseLLMClient):
             for attempt in range(2):
                 try:
                     resp = await self._client.chat.completions.create(
-                        model=model, messages=messages, max_tokens=1024,
+                        model=model, messages=messages, max_tokens=max_tokens,
                     )
                     health.mark_ok(model)
                     return resp.choices[0].message.content or ""

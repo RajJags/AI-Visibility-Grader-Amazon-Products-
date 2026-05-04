@@ -6,7 +6,7 @@
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 // ---------------------------------------------------------------------------
-// Types (mirrors backend/models.py)
+// Types
 // ---------------------------------------------------------------------------
 
 export interface Product {
@@ -63,17 +63,14 @@ export interface DiagnoseResponse {
 // ---------------------------------------------------------------------------
 
 export class APIError extends Error {
-  constructor(
-    public status: number,
-    message: string
-  ) {
+  constructor(public status: number, message: string) {
     super(message);
     this.name = "APIError";
   }
 }
 
 export interface DiagnoseRequest {
-  asin: string;
+  asin?: string;   // optional -- omit when submitting brand+title directly
   brand?: string;
   title?: string;
   category?: string;
@@ -91,11 +88,11 @@ export async function runDiagnostic(req: DiagnoseRequest): Promise<DiagnoseRespo
     try {
       const body = await res.json();
       detail = body.detail ?? detail;
-    } catch {
-      // ignore parse errors
-    }
+    } catch { /* ignore */ }
     throw new APIError(res.status, detail);
   }
 
   return res.json() as Promise<DiagnoseResponse>;
 }
+
+export { API_URL };

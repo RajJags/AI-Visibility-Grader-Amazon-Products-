@@ -35,6 +35,6 @@ class OpenAIClient(BaseLLMClient):
             code = (body.get("error") or {}).get("code", "")
             if code == "insufficient_quota":
                 raise RuntimeError(
-                    "OpenAI quota exceeded — add billing at platform.openai.com"
+                    "OpenAI quota exceeded  -  add billing at platform.openai.com"
                 ) from e
             raise

@@ -1,7 +1,7 @@
 """
-OpenRouterClient — free models via openrouter.ai (OpenAI-compatible).
+OpenRouterClient - free models via openrouter.ai (OpenAI-compatible).
 
-Free models have a `:free` suffix and never expire — they just rate-limit.
+Free models have a `:free` suffix and never expire - they just rate-limit.
 Uses the shared circuit breaker so recently-failed models are tried last
 instead of burning time re-discovering failures on every request.
 """
@@ -32,7 +32,7 @@ class OpenRouterClient(BaseLLMClient):
         )
         self._models = models or OPENROUTER_FREE_MODELS
 
-    async def query(self, prompt: str, system: str = "") -> str:
+    async def query(self, prompt: str, system: str = "", max_tokens: int = 1024) -> str:
         messages: list[dict] = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -44,7 +44,7 @@ class OpenRouterClient(BaseLLMClient):
         for model in ordered:
             try:
                 response = await self._client.chat.completions.create(
-                    model=model, messages=messages, max_tokens=1024,
+                    model=model, messages=messages, max_tokens=max_tokens,
                 )
                 health.mark_ok(model)
                 return response.choices[0].message.content or ""
