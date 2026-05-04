@@ -1,12 +1,14 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   runDiagnostic,
   type DiagnoseResponse,
   type DiagnoseRequest,
   APIError,
 } from "@/lib/api";
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 import LoadingScreen    from "@/components/LoadingScreen";
 import ScoreHero        from "@/components/ScoreHero";
 import ModelCard        from "@/components/ModelCard";
@@ -26,6 +28,11 @@ type State =
 export default function Home() {
   const [asin, setAsin] = useState("");
   const [state, setState] = useState<State>({ status: "idle" });
+
+  // Warm up the Render backend on page load to reduce cold-start delay
+  useEffect(() => {
+    fetch(`${API_URL}/health`).catch(() => {/* ignore - best effort warmup */});
+  }, []);
   const [manualBrand, setManualBrand] = useState("");
   const [manualTitle, setManualTitle] = useState("");
 
