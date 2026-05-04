@@ -45,7 +45,7 @@ Fix:
 
 ## Live Demo
 
-https://ai-visibility-grader.vercel.app
+https://aivisibilitygrader.vercel.app
 
 (First request may take ~10–15s due to backend cold start)
 
