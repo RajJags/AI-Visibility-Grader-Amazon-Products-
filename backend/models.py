@@ -15,6 +15,9 @@ class Product(BaseModel):
     category: str
     bullets: list[str] = Field(default_factory=list)
     image_url: Optional[str] = None
+    # Structured spec key:value pairs from Amazon product detail table / API
+    # e.g. {"RAM": "16 GB", "Battery Life": "18 Hours", "Display Size": "13.6 inches"}
+    specs: dict[str, str] = Field(default_factory=dict)
 
 
 class QueryResult(BaseModel):

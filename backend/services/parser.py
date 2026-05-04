@@ -10,33 +10,27 @@ import asyncio, json, re
 from llm_clients import GenerationClient
 from models import ModelMentions, ModelPositions, ParsedQueryResult, QueryResult
 
-_SYSTEM = "You are a structured data extraction assistant. Always respond with valid JSON only, no markdown, no explanation."
+_SYSTEM = "Structured data extractor. Output valid JSON only. No prose, no markdown."
 
-_BATCH_PROMPT = """Shopping query: "{query}"
-Target brand: "{brand}"
+# Compact LLM-to-LLM extraction prompt.
+# Humans never read this; optimised for token efficiency and extraction accuracy.
+_BATCH_PROMPT = """TASK: brand mention extraction from shopping assistant responses
+QUERY: {query}
+TARGET_BRAND: {brand}
 
-Three AI shopping assistant responses are shown below. For each one, extract:
-- mentioned: true if the target brand appears as a recommendation
-- position: 1-indexed rank in the numbered list (null if not in a ranked list)
-- competitors: list of OTHER real brand names recommended (not the target brand, not generic phrases)
-- attributes: key specs or features mentioned per brand (e.g. "inverter", "5-star", "copper coil")
+RESPONSES:
+A: {response_a}
+B: {response_b}
+C: {response_c}
 
-RESPONSE_A:
-{response_a}
+EXTRACT per response:
+- mentioned: true if TARGET_BRAND is recommended (exact or common short-form match)
+- position: 1-indexed rank in numbered list, null if unranked or not mentioned
+- competitors: other brand names recommended (real brands only, not generic phrases)
+- attributes: {{brand_name: [feature_strings]}} for all brands mentioned
 
-RESPONSE_B:
-{response_b}
-
-RESPONSE_C:
-{response_c}
-
-Return ONLY this JSON:
-{{
-  "a": {{"mentioned": true/false, "position": null/1/2/3, "competitors": ["Brand X", ...], "attributes": {{"Brand X": ["attr1", "attr2"]}}}},
-  "b": {{"mentioned": true/false, "position": null/1/2/3, "competitors": ["Brand X", ...], "attributes": {{}}}},
-  "c": {{"mentioned": true/false, "position": null/1/2/3, "competitors": ["Brand X", ...], "attributes": {{}}}}
-}}
-"""
+OUTPUT (JSON only, no other text):
+{{"a":{{"mentioned":bool,"position":int|null,"competitors":[],"attributes":{{}}}},"b":{{"mentioned":bool,"position":int|null,"competitors":[],"attributes":{{}}}},"c":{{"mentioned":bool,"position":int|null,"competitors":[],"attributes":{{}}}}}}"""
 
 
 def _extract_json(raw):

@@ -4,7 +4,7 @@ ProductFetcher  -  resolves an exact Amazon URL/ASIN to a Product.
 Resolution order:
   1. Rainforest API  (if RAINFOREST_API_KEY is set  -  reliable on any server)
   2. Amazon page scrape  (works locally; often blocked on cloud IPs)
-  3. Stub → frontend shows manual-entry form (HTTP 422)
+  3. Stub -> frontend shows manual-entry form (HTTP 422)
 
 On Render/cloud environments Amazon almost always blocks the scrape,
 so Rainforest is tried first to avoid a 15-second timeout on every call.
@@ -43,6 +43,14 @@ _USER_AGENTS = [
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
 
+# Keys we skip when building specs (they're captured elsewhere or unhelpful for queries)
+_SKIP_SPEC_KEYS = {
+    "asin", "best sellers rank", "customer reviews", "date first available",
+    "is discontinued by manufacturer", "item model number", "item weight",
+    "manufacturer", "part number", "upc", "ean", "isbn", "model number",
+    "country of origin",
+}
+
 
 class ProductFetchError(RuntimeError):
     """Raised when exact listing lookup cannot run because a provider is unavailable."""
@@ -79,7 +87,35 @@ def _amazon_domain(marketplace: str) -> str:
     return _MARKETPLACE_TO_HOST.get(marketplace.upper(), "amazon.in")
 
 
+def _clean_spec_key(k: str) -> str:
+    """Normalise a spec key to lowercase, stripped."""
+    return re.sub(r'\s+', ' ', k).strip().lower()
+
+
+def _clean_spec_val(v: str) -> str:
+    """Strip invisible unicode, collapse whitespace, trim."""
+    v = re.sub(r'[‎‏​ ]', ' ', v)
+    return re.sub(r'\s+', ' ', v).strip()
+
+
+def _specs_from_pairs(pairs: list[tuple[str, str]]) -> dict[str, str]:
+    """Convert raw (key, value) pairs into a filtered specs dict."""
+    specs: dict[str, str] = {}
+    for raw_k, raw_v in pairs:
+        k = _clean_spec_key(raw_k)
+        v = _clean_spec_val(raw_v)
+        if not k or not v:
+            continue
+        if k in _SKIP_SPEC_KEYS:
+            continue
+        # Use title-cased key for readability
+        specs[raw_k.strip()] = v
+    return specs
+
+
+# ---------------------------------------------------------------------------
 # Canopy
+# ---------------------------------------------------------------------------
 
 def _first_string(*values) -> str:
     for value in values:
@@ -133,6 +169,35 @@ def _canopy_category(product: dict) -> str:
     return _STUB_CATEGORY
 
 
+def _canopy_specs(product: dict) -> dict[str, str]:
+    """
+    Extract structured specs from any Canopy response shape.
+    Tries: technicalDetails (dict), specifications (list or dict), attributes (dict).
+    """
+    pairs: list[tuple[str, str]] = []
+
+    for key in ("technicalDetails", "technical_details", "specifications",
+                "technicalSpecifications", "attributes", "productDetails"):
+        val = product.get(key)
+        if not val:
+            continue
+        if isinstance(val, dict):
+            for k, v in val.items():
+                if isinstance(v, (str, int, float)):
+                    pairs.append((str(k), str(v)))
+            break
+        if isinstance(val, list):
+            for item in val:
+                if isinstance(item, dict):
+                    k = _first_string(item.get("name"), item.get("label"), item.get("key"))
+                    v = _first_string(item.get("value"), item.get("val"))
+                    if k and v:
+                        pairs.append((k, v))
+            break
+
+    return _specs_from_pairs(pairs)
+
+
 def _fetch_canopy_sync(asin: str, marketplace: str) -> dict:
     api_key = os.environ.get("CANOPY_API_KEY", "")
     if not api_key:
@@ -171,6 +236,7 @@ async def _try_canopy(asin: str, marketplace: str) -> Product | None:
             category=_canopy_category(product),
             bullets=_canopy_bullets(product),
             image_url=image_url,
+            specs=_canopy_specs(product),
         )
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
@@ -187,7 +253,9 @@ async def _try_canopy(asin: str, marketplace: str) -> Product | None:
         return None
 
 
+# ---------------------------------------------------------------------------
 # Keepa
+# ---------------------------------------------------------------------------
 
 def _keepa_image_url(images_csv: str | None) -> str | None:
     if not images_csv:
@@ -203,6 +271,30 @@ def _keepa_category(product: dict) -> str:
     if category_tree and isinstance(category_tree[0], dict):
         return category_tree[0].get("name") or _STUB_CATEGORY
     return product.get("productGroup") or _STUB_CATEGORY
+
+
+def _keepa_specs(prod: dict) -> dict[str, str]:
+    """
+    Keepa stores specs in 'technicalDetails' (dict), 'details' (dict),
+    or as key/value pairs inside the product dict itself.
+    """
+    pairs: list[tuple[str, str]] = []
+    for key in ("technicalDetails", "technical_details", "details", "attributes"):
+        val = prod.get(key)
+        if isinstance(val, dict):
+            for k, v in val.items():
+                if isinstance(v, (str, int, float)):
+                    pairs.append((str(k), str(v)))
+            break
+        if isinstance(val, list):
+            for item in val:
+                if isinstance(item, dict):
+                    k = _first_string(item.get("name"), item.get("label"))
+                    v = _first_string(item.get("value"), item.get("val"))
+                    if k and v:
+                        pairs.append((k, v))
+            break
+    return _specs_from_pairs(pairs)
 
 
 def _fetch_keepa_sync(asin: str) -> dict:
@@ -241,6 +333,7 @@ async def _try_keepa(asin: str) -> Product | None:
             category=_keepa_category(prod),
             bullets=[str(b) for b in bullets[:10]],
             image_url=_keepa_image_url(prod.get("imagesCSV")),
+            specs=_keepa_specs(prod),
         )
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
@@ -257,7 +350,9 @@ async def _try_keepa(asin: str) -> Product | None:
         return None
 
 
-# ── Rainforest ────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Rainforest
+# ---------------------------------------------------------------------------
 
 def _fetch_rainforest_sync(asin: str, marketplace: str) -> dict:
     api_key = os.environ.get("RAINFOREST_API_KEY", "")
@@ -269,6 +364,32 @@ def _fetch_rainforest_sync(asin: str, marketplace: str) -> dict:
         resp = client.get("https://api.rainforestapi.com/request", params=params)
         resp.raise_for_status()
         return resp.json()
+
+
+def _rainforest_specs(prod: dict) -> dict[str, str]:
+    """
+    Rainforest returns specs as prod["specifications"]: [{"name": "...", "value": "..."}, ...]
+    Also check prod["attributes"] if present.
+    """
+    pairs: list[tuple[str, str]] = []
+    for key in ("specifications", "attributes", "technical_specifications"):
+        val = prod.get(key)
+        if isinstance(val, list):
+            for item in val:
+                if isinstance(item, dict):
+                    k = _first_string(item.get("name"), item.get("label"))
+                    v = _first_string(item.get("value"), item.get("val"))
+                    if k and v:
+                        pairs.append((k, v))
+            if pairs:
+                break
+        elif isinstance(val, dict):
+            for k, v in val.items():
+                if isinstance(v, (str, int, float)):
+                    pairs.append((str(k), str(v)))
+            if pairs:
+                break
+    return _specs_from_pairs(pairs)
 
 
 async def _try_rainforest(asin: str, marketplace: str) -> Product | None:
@@ -288,7 +409,8 @@ async def _try_rainforest(asin: str, marketplace: str) -> Product | None:
         bullets = prod.get("feature_bullets", []) or []
         image_url = (prod.get("main_image") or {}).get("link")
         return Product(asin=asin, brand=brand, title=title, category=category,
-                       bullets=bullets[:10], image_url=image_url)
+                       bullets=bullets[:10], image_url=image_url,
+                       specs=_rainforest_specs(prod))
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
         if status in (401, 402, 403, 429):
@@ -301,7 +423,51 @@ async def _try_rainforest(asin: str, marketplace: str) -> Product | None:
         return None
 
 
-# ── Amazon scrape ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Amazon scrape
+# ---------------------------------------------------------------------------
+
+def _scrape_specs(soup: BeautifulSoup) -> dict[str, str]:
+    """
+    Parse Amazon product detail tables into a specs dict.
+    Tries multiple selectors in priority order:
+      1. #productDetails_techSpec_section_1  (main tech specs table)
+      2. #productDetails_techSpec_section_2  (additional specs)
+      3. #productDetails_db_sections         (some categories)
+      4. #detailBullets_feature_div          (detail bullets list)
+    """
+    pairs: list[tuple[str, str]] = []
+
+    # Table-style detail sections
+    for selector in (
+        "#productDetails_techSpec_section_1 tr",
+        "#productDetails_techSpec_section_2 tr",
+        "#productDetails_db_sections tr",
+        ".prodDetTable tr",
+    ):
+        rows = soup.select(selector)
+        for row in rows:
+            th = row.select_one("th")
+            td = row.select_one("td")
+            if th and td:
+                k = th.get_text(" ", strip=True)
+                v = td.get_text(" ", strip=True)
+                if k and v:
+                    pairs.append((k, v))
+
+    # Bullet-style detail section (fallback / supplement)
+    if not pairs:
+        for li in soup.select("#detailBullets_feature_div li"):
+            text = li.get_text(" ", strip=True)
+            # Format: "Key ‏ : ‎ Value"
+            parts = re.split(r"[‎‏:]+", text, maxsplit=1)
+            if len(parts) == 2:
+                k, v = parts[0].strip(), parts[1].strip()
+                if k and v:
+                    pairs.append((k, v))
+
+    return _specs_from_pairs(pairs)
+
 
 async def _scrape_amazon(asin: str, marketplace: str) -> Product | None:
     url = f"https://www.{_amazon_domain(marketplace)}/dp/{asin}"
@@ -368,13 +534,15 @@ async def _scrape_amazon(asin: str, marketplace: str) -> Product | None:
     img = soup.select_one("#imgTagWrapperId img, #landingImage")
     image_url = (img.get("src") or img.get("data-old-hires")) if img else None
 
+    specs = _scrape_specs(soup)
+
     return Product(asin=asin, brand=brand, title=title, category=category,
-                   bullets=bullets[:10], image_url=image_url)
+                   bullets=bullets[:10], image_url=image_url, specs=specs)
 
 
-
-
-# ── Public entry point ────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 
 async def fetch_product(raw_input: str, manual_brand: str | None = None,
                         manual_title: str | None = None) -> Product:

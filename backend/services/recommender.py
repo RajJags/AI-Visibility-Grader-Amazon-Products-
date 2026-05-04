@@ -1,246 +1,199 @@
-"""Recommender -- data-driven gap analysis + LLM phrasing.
+"""Recommender -- four-signal gap analysis feeding a narrative LLM prompt.
 
-Architecture:
-  1. Python identifies genuine gaps:
-     - Which queries did we lose?
-     - What attributes did competitors get praised for in those lost queries?
-     - Which of those attributes are absent from our listing?
-  2. LLM only writes actionable advice for the confirmed gaps.
-     It does NOT decide what the gaps are.
+Signals (all from existing parsed data, no extra LLM calls):
+  1. Our attributes from WON queries  -- what AI already praises us for
+  2. Competitor attributes from ALL queries, weighted by context:
+       lost query = weight 2 (absent entirely)
+       won query  = weight 1 (present but competitor also praised for something we lack)
+     This ensures gaps don't dry up as score improves.
+  3. Query-type win/loss breakdown -- where the gap is (use-case vs spec vs comparison)
+  4. Position when mentioned -- visibility problem vs differentiation problem
 """
 
 from __future__ import annotations
 import json, re
-from collections import Counter
+from collections import Counter, defaultdict
 from llm_clients import GenerationClient
 from llm_clients.gemini_client import GeminiClient
 from models import ParsedQueryResult, Product, Recommendation, Score
 
 _SYSTEM = (
-    "You are an expert Amazon listing consultant. "
-    "Write specific, actionable listing improvements based on confirmed data."
+    "You are an expert Amazon listing consultant specialising in AI search visibility. "
+    "Write specific, actionable listing improvements grounded only in the data provided."
 )
 
 _PROMPT = """Product: {title}
 Brand: {brand} | Category: {category}
-Current listing text: {listing_text}
+Current listing:
+{listing_text}
 
-Analysis of AI model responses across {total_queries} buyer queries:
-- Score: {overall}/100
-- Queries lost (brand not recommended): {lost_queries}
-- Queries won: {won_queries}
+--- DIAGNOSTIC DATA ---
 
-CONFIRMED GAPS -- attributes AI models praised competitors for in queries we LOST,
-which do NOT appear in our current listing:
+Overall AI visibility score: {overall}/100
+  Llama 3.3 (70B): {gpt4}/100 | Llama 3.1 (8B): {claude}/100 | Gemini: {gemini}/100
+
+Win rate by query type:
+{query_type_breakdown}
+
+When mentioned, average recommendation position: {position_summary}
+
+What AI models already praise this product for (strengths to reinforce):
+{our_attributes}
+
+Confirmed gaps -- attributes AI praised competitors for, absent from our listing
+(weight 2 = from lost queries, weight 1 = from won queries where competitor also appeared):
 {gaps}
 
-For each gap above, write one recommendation explaining how to address it in the Amazon listing.
-Be specific: name the listing section to update (title, bullet 1-2, A+ content, backend keywords)
-and explain exactly what to add and why it helps AI visibility.
+--- TASK ---
 
-Return ONLY a JSON array of exactly {n_gaps} objects, no markdown:
-[{{"title":"<8 words imperative>","description":"2 sentences with specific advice","priority":"high|medium|low"}}]
-"""
-
-_FALLBACK_PROMPT = """Product: {title}
-Brand: {brand} | Category: {category}
-Product type: {product_type}
-Current listing text: {listing_text}
-Score: {overall}/100. Lost queries: {lost_queries}. Won queries: {won_queries}.
-
-No specific attribute gaps were detected from the query data.
-Based on the category and lost queries, write 3 general recommendations
-to improve AI search visibility for this listing.
-Focus only on {product_type}: use-case language, quantified claims, and buyer-intent phrasing.
-Do not suggest features already mentioned in the listing text above.
-Do not mention unrelated categories, gaming, laptops, displays, frame rates, or processors.
+Write exactly 3 recommendations to improve AI visibility.
+Each must:
+- Address a confirmed gap or a weak query-type win rate
+- Name the exact listing element to change (title, product bullet 1-5, enhanced brand content section, search terms)
+- Reference the specific data point that justifies it
+- NOT suggest adding anything already in the listing text above
 
 Return ONLY a JSON array of 3 objects, no markdown:
-[{{"title":"<8 words imperative>","description":"2 sentences with specific advice","priority":"high|medium|low"}}]
+[{{"title":"<8 words imperative>","description":"2 sentences with specific data-backed advice","priority":"high|medium|low"}}]
 """
 
-_UNRELATED_REC_TERMS = frozenset([
-    "gaming", "laptop", "laptops", "processor", "processors", "frame rate",
-    "frame rates", "graphics", "display", "benchmark", "benchmarks", "titles",
-    "content creation",
-])
+_FALLBACK_PROMPT = """Product: {title} | Brand: {brand} | Category: {category}
+Score: {overall}/100. Lost queries: {lost_queries}. Won queries: {won_queries}.
+Current listing: {listing_text}
 
-_PHONE_UNRELATED_REC_TERMS = frozenset([
-    "case", "cases", "cover", "covers", "screen protector", "protectors",
-    "insurance", "applecare", "protection plan", "warranty plan",
-])
+Write 3 recommendations to improve AI search visibility.
+Do not suggest anything already in the listing text.
+Each must name the listing element to change and why it helps AI visibility.
 
-
-def _product_type(product: Product) -> str:
-    text = f"{product.title} {product.category}".lower()
-    if any(term in text for term in ("airwrap", "styler", "coanda", "cold shot", "hair")):
-        return "hair styling tools"
-    if any(term in text for term in ("iphone", "smartphone", "phone", "mobile")):
-        return "smartphones"
-    return product.category if product.category and product.category != "Health & Household" else "this product category"
+Return ONLY a JSON array of 3 objects, no markdown:
+[{{"title":"<8 words imperative>","description":"2 sentences","priority":"high|medium|low"}}]
+"""
 
 
-def _has_unrelated_terms(text: str, product: Product) -> bool:
-    product_type = _product_type(product)
-    lower = text.lower()
-    if product_type == "hair styling tools":
-        return any(term in lower for term in _UNRELATED_REC_TERMS)
-    if product_type == "smartphones":
-        return any(term in lower for term in _PHONE_UNRELATED_REC_TERMS)
-    return False
+def _classify_query(query: str) -> str:
+    q = query.lower()
+    if re.search(r'\d+\s*(?:hz|gb|tb|mah|hr|hour|watt|inch|mm|k\b)', q):
+        return "attribute-specific"
+    if any(w in q for w in ["best", "top", "vs", "compare", "recommended", "which", "under", "worth"]):
+        return "comparison"
+    if any(w in q for w in ["for ", "to ", "while", "during", "when", "how to", "what "]):
+        return "problem-first"
+    return "general"
 
 
-def _fallback_recommendations(product: Product) -> list[Recommendation]:
-    if _product_type(product) == "hair styling tools":
-        return [
-            Recommendation(
-                title="Add hair-type use cases",
-                description=(
-                    "Add bullets for curls, waves, frizz control, damaged hair, and quick styling routines. "
-                    "AI assistants match problem-first searches when the listing names the exact hair need."
-                ),
-                priority="high",
-            ),
-            Recommendation(
-                title="Quantify heat-protection claims",
-                description=(
-                    "State what the 3 heat settings, cold shot, 1300W motor, and Coanda airflow do in plain buyer language. "
-                    "Specific claims make the listing easier to retrieve for heat-damage and airflow queries."
-                ),
-                priority="high",
-            ),
-            Recommendation(
-                title="Expand attachment guidance",
-                description=(
-                    "Use A+ content or bullets to map each attachment to the style it creates and the hair type it serves. "
-                    "This helps AI models connect the product to searches for curls, waves, smoothing, drying, and volume."
-                ),
-                priority="medium",
-            ),
-        ]
-    if _product_type(product) == "smartphones":
-        return [
-            Recommendation(
-                title="Clarify camera strengths",
-                description=(
-                    "Add bullets that name camera use cases such as low-light photos, zoom, video stabilization, and portraits. "
-                    "AI assistants often match phone recommendations to the specific camera problem a shopper describes."
-                ),
-                priority="high",
-            ),
-            Recommendation(
-                title="Quantify battery and performance",
-                description=(
-                    "State battery life, charging behavior, chipset performance, and storage benefits in direct buyer language. "
-                    "Specific claims help the listing compete for premium smartphone searches."
-                ),
-                priority="high",
-            ),
-            Recommendation(
-                title="Add buyer-intent keywords",
-                description=(
-                    "Use backend keywords and A+ copy for phrases like premium smartphone, best camera phone, long battery life, and high storage. "
-                    "These terms align the listing with natural AI shopping queries without relying on brand searches."
-                ),
-                priority="medium",
-            ),
-        ]
-    return [
-        Recommendation(
-            title="Add specific use cases",
-            description=(
-                "Update the first bullets with concrete buyer scenarios that fit this product category. "
-                "AI assistants are more likely to recommend listings that mirror problem-first searches."
-            ),
-            priority="high",
-        ),
-        Recommendation(
-            title="Quantify key claims",
-            description=(
-                "Replace vague benefit language with measurable specs or concrete outcomes from the listing. "
-                "Specific evidence helps AI models distinguish this product from similar competitors."
-            ),
-            priority="high",
-        ),
-        Recommendation(
-            title="Mirror buyer search language",
-            description=(
-                "Add backend keywords and A+ copy using natural phrases from the lost queries. "
-                "This improves retrieval for shoppers who describe needs instead of searching by brand."
-            ),
-            priority="medium",
-        ),
-    ]
+def _query_type_breakdown(results: list[ParsedQueryResult]) -> str:
+    buckets: dict[str, list[bool]] = defaultdict(list)
+    for r in results:
+        won = bool(r.mentions.gpt4 or r.mentions.claude or r.mentions.gemini)
+        buckets[_classify_query(r.query)].append(won)
+    lines = []
+    for bucket, outcomes in sorted(buckets.items()):
+        wins = sum(outcomes)
+        total = len(outcomes)
+        pct = round(wins / total * 100)
+        lines.append(f"  {bucket}: {wins}/{total} won ({pct}%)")
+    return "\n".join(lines) if lines else "  insufficient data"
 
 
-def _listing_tokens(title: str, bullets: list[str]) -> set[str]:
-    """Extract a set of normalised tokens from the current listing for gap detection."""
-    text = (title + " " + " ".join(bullets)).lower()
-    # Individual words + common bigrams
+def _position_summary(results: list[ParsedQueryResult]) -> str:
+    positions = []
+    for r in results:
+        if not (r.mentions.gpt4 or r.mentions.claude or r.mentions.gemini):
+            continue
+        vals = [p for p in [r.position.gpt4, r.position.claude, r.position.gemini]
+                if p is not None]
+        if vals:
+            positions.append(min(vals))
+    if not positions:
+        return "never ranked (brand not recommended in any query)"
+    avg = sum(positions) / len(positions)
+    if avg <= 1.5:
+        return f"avg {avg:.1f} -- strong (top of list)"
+    if avg <= 2.5:
+        return f"avg {avg:.1f} -- moderate (mid-list, needs differentiation)"
+    return f"avg {avg:.1f} -- weak (bottom of list, needs stronger signals)"
+
+
+def _our_attributes(results: list[ParsedQueryResult], brand: str) -> str:
+    brand_lower = brand.lower()
+    counter: Counter[str] = Counter()
+    for r in results:
+        if not (r.mentions.gpt4 or r.mentions.claude or r.mentions.gemini):
+            continue
+        for bk, attrs in r.attributes.items():
+            if bk.lower() == brand_lower:
+                for a in attrs:
+                    counter[a.strip()] += 1
+    if not counter:
+        return "  none detected (AI did not attribute specific features to this brand)"
+    return "\n".join(f"  - {a} ({n}x)" for a, n in counter.most_common(6))
+
+
+def _listing_tokens(title: str, bullets: list[str], specs: dict[str, str] | None = None) -> set[str]:
+    """
+    Build a normalised token set from title + bullets + structured specs.
+    Specs are the authoritative source for measurable values like "16GB", "144Hz".
+    """
+    parts = [title] + bullets
+    if specs:
+        # Add all spec values so gap validator knows what's confirmed in listing data
+        parts += list(specs.values())
+    text = " ".join(parts).lower()
     words = set(re.findall(r'\b[a-z][a-z0-9\-]{1,}\b', text))
-    bigrams = set()
+    words |= set(re.findall(r'\b\d+[a-z]+\b', text))
     ws = list(re.findall(r'\b[a-z][a-z0-9\-]{1,}\b', text))
-    for i in range(len(ws) - 1):
-        bigrams.add(ws[i] + " " + ws[i+1])
+    bigrams = {ws[i] + " " + ws[i+1] for i in range(len(ws)-1)}
     return words | bigrams
 
 
 def _attr_in_listing(attr: str, tokens: set[str]) -> bool:
-    """Return True if the attribute is already represented in the listing."""
-    attr_words = set(re.findall(r'\b[a-z][a-z0-9\-]{1,}\b', attr.lower()))
-    # Consider it present if all meaningful words of the attribute appear
-    meaningful = [w for w in attr_words if len(w) > 2]
+    meaningful = [w for w in re.findall(r'\b[a-z][a-z0-9\-]{1,}\b', attr.lower()) if len(w) > 2]
     if not meaningful:
         return True
     return all(w in tokens or any(w in t for t in tokens) for w in meaningful)
 
 
-def _find_gaps(
-    results: list[ParsedQueryResult],
-    brand: str,
-    listing_tokens: set[str],
-) -> list[tuple[str, int, list[str]]]:
+def _find_gaps(results: list[ParsedQueryResult], brand: str,
+               tokens: set[str]) -> list[tuple[str, int, list[str]]]:
     """
-    Returns list of (attribute, frequency, example_queries) for attributes that:
-    - Appeared in competitor responses for queries we LOST
-    - Are NOT present in our listing
-    - Are not keyed to the target brand itself
-    Sorted by frequency descending.
+    Mine competitor attributes from ALL queries, weighted by context:
+      lost query = weight 2 (brand absent entirely)
+      won query  = weight 1 (brand present but competitor also praised for something we lack)
+    Ensures gap detection stays rich even when score is high.
     """
     brand_lower = brand.lower()
-    attr_counter: Counter[str] = Counter()
+    scores: Counter[str] = Counter()
     attr_queries: dict[str, list[str]] = {}
-
     for r in results:
-        lost = not (r.mentions.gpt4 or r.mentions.claude or r.mentions.gemini)
-        if not lost:
-            continue
+        won = bool(r.mentions.gpt4 or r.mentions.claude or r.mentions.gemini)
+        weight = 1 if won else 2
         for bk, attrs in r.attributes.items():
             if bk.lower() == brand_lower:
                 continue
             for a in attrs:
                 a = a.strip()
-                if len(a) < 3:
+                if len(a) < 3 or re.match(r'^[A-Z]{2,6}$', a):
                     continue
-                # Skip things that look like brand/model names (short all-caps, proper nouns)
-                if re.match(r'^[A-Z]{2,6}$', a):
+                # Skip if it looks like a proper noun / brand name (multi-word with capitals)
+                # e.g. "Bang & Olufsen Speakers", "Dolby Atmos Certification"
+                words = a.split()
+                if len(words) >= 2 and sum(1 for w in words if w[0].isupper()) >= 2:
+                    # Allow if it contains a measurable spec token (e.g. "120Hz Display")
+                    has_spec = bool(re.search(r'\d+\s*(?:hz|gb|tb|mah|w\b|mm\b|inch)', a.lower()))
+                    if not has_spec:
+                        continue
+                if _attr_in_listing(a, tokens):
                     continue
-                if _attr_in_listing(a, listing_tokens):
-                    continue
-                attr_counter[a] += 1
+                scores[a] += weight
                 attr_queries.setdefault(a, [])
                 if r.query not in attr_queries[a]:
                     attr_queries[a].append(r.query)
-
-    return [
-        (attr, count, attr_queries[attr][:2])
-        for attr, count in attr_counter.most_common(6)
-    ]
+    return [(a, n, attr_queries[a][:2]) for a, n in scores.most_common(6)]
 
 
 def _fmt_queries(results: list[ParsedQueryResult], won: bool) -> str:
     filtered = [r for r in results
-                if won == (r.mentions.gpt4 or r.mentions.claude or r.mentions.gemini)]
+                if won == bool(r.mentions.gpt4 or r.mentions.claude or r.mentions.gemini)]
     return "; ".join(r.query for r in filtered[:3]) or "none"
 
 
@@ -272,70 +225,75 @@ async def generate_recommendations(
 ) -> list[Recommendation]:
 
     listing_text = product.title + "\n" + "\n".join(f"- {b}" for b in product.bullets[:6])
-    listing_tokens = _listing_tokens(product.title, product.bullets)
+    # Pass specs to listing tokens so confirmed spec values aren't flagged as gaps
+    tokens = _listing_tokens(product.title, product.bullets, specs=product.specs)
+    gaps = _find_gaps(results, product.brand, tokens)[:3]
 
-    gaps = _find_gaps(results, product.brand, listing_tokens)
-    top_3_gaps = gaps[:3]
-
-    lost_str = _fmt_queries(results, won=False)
-    won_str  = _fmt_queries(results, won=True)
-
-    if top_3_gaps:
+    if gaps:
         gap_lines = "\n".join(
-            f"- \"{attr}\" (seen {count}x in lost queries: {', '.join(qs)})"
-            for attr, count, qs in top_3_gaps
+            f"  - \"{attr}\" (score {n}, queries: {', '.join(qs)})"
+            for attr, n, qs in gaps
         )
         prompt = _PROMPT.format(
             title=product.title,
             brand=product.brand,
             category=product.category,
             listing_text=listing_text[:600],
-            total_queries=len(results),
             overall=score.overall,
-            lost_queries=lost_str,
-            won_queries=won_str,
+            gpt4=score.gpt4,
+            claude=score.claude,
+            gemini=score.gemini,
+            query_type_breakdown=_query_type_breakdown(results),
+            position_summary=_position_summary(results),
+            our_attributes=_our_attributes(results, product.brand),
             gaps=gap_lines,
-            n_gaps=len(top_3_gaps),
         )
     else:
         prompt = _FALLBACK_PROMPT.format(
             title=product.title,
             brand=product.brand,
             category=product.category,
-            product_type=_product_type(product),
             listing_text=listing_text[:600],
             overall=score.overall,
-            lost_queries=lost_str,
-            won_queries=won_str,
+            lost_queries=_fmt_queries(results, won=False),
+            won_queries=_fmt_queries(results, won=True),
         )
 
     raw = ""
     try:
-        gem = GeminiClient()
-        raw = await gem.query(prompt, system=_SYSTEM, max_tokens=700)
+        raw = await GeminiClient().query(prompt, system=_SYSTEM, max_tokens=700)
     except Exception:
         pass
     if not raw:
-        client = GenerationClient()
-        raw = await client.query(prompt, system=_SYSTEM, max_tokens=700)
+        raw = await GenerationClient().query(prompt, system=_SYSTEM, max_tokens=700)
 
     data = _parse_recs(raw)
+    recs: list[Recommendation] = [
+        Recommendation(
+            title=str(item.get("title", "Improve listing")),
+            description=str(item.get("description", "")),
+            priority=str(item.get("priority", "medium")).lower(),
+        )
+        for item in data[:3] if isinstance(item, dict)
+    ]
 
-    recs: list[Recommendation] = []
-    for item in data[:3]:
-        if isinstance(item, dict):
-            rec = Recommendation(
-                title=str(item.get("title", "Improve listing")),
-                description=str(item.get("description", "")),
-                priority=str(item.get("priority", "medium")).lower(),
-            )
-            if not _has_unrelated_terms(f"{rec.title} {rec.description}", product):
-                recs.append(rec)
-
-    for fallback in _fallback_recommendations(product):
+    fallbacks = [
+        ("Add use-case scenarios to first two bullets",
+         "State specific activities in bullets 1-2. "
+         "AI models match problem-first queries to listings that name the activity explicitly.",
+         "high"),
+        ("Include quantified performance benchmarks",
+         "Add measurable claims in a dedicated bullet. "
+         "AI assistants surface products with verifiable data over vague descriptions.",
+         "high"),
+        ("Expand A+ content with buyer-intent language",
+         "Use problem-solution framing in A+ sections. "
+         "AI models weight structured content mirroring how buyers phrase queries.",
+         "medium"),
+    ]
+    for t, d, p in fallbacks:
         if len(recs) >= 3:
             break
-        if not any(existing.title == fallback.title for existing in recs):
-            recs.append(fallback)
+        recs.append(Recommendation(title=t, description=d, priority=p))
 
     return recs
