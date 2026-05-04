@@ -5,7 +5,7 @@ import "./globals.css";
 const inter = Inter({ subsets: ["latin"], display: "swap" });
 
 export const metadata: Metadata = {
-  title: "AI Visibility Grader — by Pixii",
+  title: "AI Visibility Grader",
   description:
     "Find out how often AI shopping assistants recommend your Amazon product — before your competitors do.",
   openGraph: {
@@ -22,3 +22,4 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     </html>
   );
 }
+
