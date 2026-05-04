@@ -1,7 +1,7 @@
 """QueryGenerator -- structured two-step query generation. Always returns exactly 6."""
 
 from __future__ import annotations
-import json, re
+import json, os, re
 from pydantic import TypeAdapter, ValidationError
 from llm_clients import GenerationClient
 from models import Product
@@ -36,6 +36,7 @@ Query patterns to use:
 
 Rules:
   - Use actual numbers from the specs above (e.g. "15hr battery", "16GB RAM", "144Hz display")
+  - If using price, include the currency (e.g. "under $20", "under 1500 INR")
   - 4-12 words, conversational natural language
   - NO brand names, model numbers, or proprietary feature names
   - Vary the patterns
@@ -57,7 +58,7 @@ Step 1 -- extract these four things about the product:
 
 Step 2 -- generate 8 search queries using the extracted values above.
 Use these query patterns, populated with real values from Step 1:
-  - "best [form_factor] under [price_tier budget amount] for [use_case]"
+  - "best budget [form_factor] for [use_case]"
   - "[form_factor] with [top_spec] for [use_case]"
   - "[form_factor] good for [use_case] and [use_case]"
   - "most [attribute] [form_factor] in [price_tier]"
@@ -65,7 +66,8 @@ Use these query patterns, populated with real values from Step 1:
   - "[form_factor] with [spec1] and [spec2]"
 
 Rules:
-  - Use actual spec numbers and price amounts, not vague words like "long" or "good"
+  - Use actual spec numbers, not vague words like "long" or "good"
+  - Only use price amounts when a real amount and currency are present in the listing
   - 4-12 words, conversational natural language
   - NO brand names, model numbers, or proprietary feature names
   - Vary the patterns -- do not repeat the same structure 8 times
@@ -76,14 +78,56 @@ Return ONLY a JSON array of 8 query strings. No other text.
 _SPEC_UNITS = frozenset(["gb", "mb", "tb", "mp", "mah", "hz", "ghz", "mhz",
                           "mm", "cm", "nm", "w", "mw", "db", "fps", "ms"])
 
-_FALLBACKS = [
-    "best value option with good reviews in this category",
-    "reliable pick with long lasting build quality",
-    "top rated product for everyday use",
-    "highly rated option with fast charging support",
-    "best performance per dollar in this category",
-    "popular choice with good warranty and support",
-]
+_CATEGORY_FALLBACKS = {
+    "electronics": [
+        "best value electronics for everyday use",
+        "reliable device with long lasting performance",
+        "top rated option with useful smart features",
+        "best device with dependable battery life",
+        "popular choice with good warranty support",
+        "easy to use device for daily tasks",
+    ],
+    "beauty": [
+        "best beauty tool for everyday styling",
+        "gentle option for daily personal care",
+        "top rated product for easy routines",
+        "beauty tool for salon like results",
+        "reliable product for sensitive users",
+        "popular choice for quick daily use",
+    ],
+    "health": [
+        "best health product for daily wellness",
+        "reliable option for everyday home use",
+        "top rated product for family care",
+        "easy to use health product at home",
+        "popular wellness product with good reviews",
+        "safe option for regular personal care",
+    ],
+    "home": [
+        "best home product for everyday use",
+        "reliable option for small spaces",
+        "top rated product for home organization",
+        "easy to use product for busy households",
+        "durable product for daily home needs",
+        "popular choice for practical home use",
+    ],
+    "fashion": [
+        "best comfortable option for daily wear",
+        "top rated style for everyday outfits",
+        "durable option for regular use",
+        "popular choice with good fit",
+        "versatile style for casual wear",
+        "reliable option with comfortable material",
+    ],
+    "default": [
+        "best value option with good reviews",
+        "reliable pick with long lasting build quality",
+        "top rated product for everyday use",
+        "easy to use option for daily needs",
+        "popular choice with dependable quality",
+        "well reviewed product for regular use",
+    ],
+}
 
 # Spec keys that are directly useful for query generation (measurable / comparable)
 _QUERY_USEFUL_SPECS = {
@@ -114,6 +158,127 @@ def _format_specs_for_prompt(specs: dict[str, str], max_entries: int = 12) -> st
     ordered = sorted(specs.items(), key=lambda kv: -score_key(kv[0]))
     lines = [f"  {k}: {v}" for k, v in ordered[:max_entries]]
     return "\n".join(lines)
+
+
+def _fallback_bucket(product: Product) -> str:
+    text = " ".join(
+        [
+            product.title,
+            product.category,
+            " ".join(product.bullets[:5]),
+            " ".join(product.specs.keys()),
+            " ".join(product.specs.values()),
+        ]
+    ).lower()
+    if any(term in text for term in (
+        "phone", "smartphone", "laptop", "computer", "tablet", "earbud",
+        "headphone", "speaker", "camera", "monitor", "keyboard", "mouse",
+        "charger", "battery", "bluetooth", "wireless", "electronics",
+    )):
+        return "electronics"
+    if any(term in text for term in (
+        "beauty", "hair", "skin", "makeup", "styler", "shampoo", "serum",
+        "conditioner", "grooming", "cosmetic", "personal care",
+    )):
+        return "beauty"
+    if any(term in text for term in (
+        "health", "wellness", "supplement", "vitamin", "medical", "fitness",
+        "nutrition", "hygiene", "household", "baby care",
+    )):
+        return "health"
+    if any(term in text for term in (
+        "home", "kitchen", "furniture", "decor", "storage", "cleaning",
+        "appliance", "bedding", "bath", "garden",
+    )):
+        return "home"
+    if any(term in text for term in (
+        "shirt", "shoe", "jeans", "dress", "fashion", "apparel", "clothing",
+        "wear", "watch", "bag", "wallet",
+    )):
+        return "fashion"
+    return "default"
+
+
+def _fallbacks_for(product: Product) -> list[str]:
+    return _CATEGORY_FALLBACKS[_fallback_bucket(product)]
+
+
+def _currency_hint(product: Product | None) -> str:
+    text = ""
+    if product:
+        text = " ".join(
+            [product.title, product.category]
+            + list(product.specs.keys())
+            + list(product.specs.values())
+        ).lower()
+    if any(token in text for token in ("₹", "inr", "rs.", "rs ", "rupee", "rupees")):
+        return "INR"
+    if any(token in text for token in ("$", "usd", "dollar", "dollars")):
+        return "dollars"
+    if any(token in text for token in ("£", "gbp", "pound", "pounds")):
+        return "GBP"
+    if any(token in text for token in ("€", "eur", "euro", "euros")):
+        return "EUR"
+
+    marketplace = os.environ.get("AMAZON_MARKETPLACE", "IN").upper()
+    return {
+        "IN": "INR",
+        "US": "dollars",
+        "CA": "CAD",
+        "UK": "GBP",
+        "DE": "EUR",
+        "FR": "EUR",
+        "IT": "EUR",
+        "ES": "EUR",
+        "AU": "AUD",
+        "JP": "JPY",
+    }.get(marketplace, "dollars")
+
+
+def _format_under_price(amount: str, currency: str) -> str:
+    if currency == "dollars":
+        return f"under {amount} dollars"
+    return f"under {currency} {amount}"
+
+
+def _add_missing_under_currency(query: str, currency: str) -> str:
+    currencies = r"(?:dollars?|usd|inr|rupees?|rs\.?|₹|\$|gbp|pounds?|eur|euros?|cad|aud|jpy)"
+
+    def repl(match: re.Match[str]) -> str:
+        return _format_under_price(match.group("amount"), currency)
+
+    return re.sub(
+        rf"\bunder\s+(?P<amount>\d+(?:,\d{{3}})*(?:\.\d+)?)\b(?!\s*{currencies})",
+        repl,
+        query,
+        flags=re.IGNORECASE,
+    )
+
+
+def _clean_query_text(query: str, product: Product | None = None) -> str:
+    q = re.sub(r"\s+", " ", query.strip().lower())
+    q = q.strip(" .?!,;:")
+
+    q = re.sub(r"\bunder\s+budget\s+(\d+)\b", r"under \1", q)
+    q = re.sub(r"\bin\s+budget\b", "", q)
+    q = re.sub(r"\bbudget\s+friendly\b", "budget-friendly", q)
+    q = re.sub(r"\bgood\s+for\b", "for", q)
+    q = re.sub(r"\b(\d+)\s*hours?\s+playtime\b", r"\1-hour playtime", q)
+    q = re.sub(r"\b(\d+)\s*hours?\s+battery\b", r"\1-hour battery", q)
+    q = re.sub(r"\b(\d+)\s*hours?\s+of\s+playtime\b", r"\1-hour playtime", q)
+    q = re.sub(r"\b(\d+)\s*hr\s+playtime\b", r"\1-hour playtime", q)
+    q = re.sub(r"\b(\d+)\s*hrs\s+playtime\b", r"\1-hour playtime", q)
+    q = _add_missing_under_currency(q, _currency_hint(product))
+
+    q = re.sub(r"\s+", " ", q).strip()
+    q = re.sub(r"\binr\b", "INR", q)
+    q = re.sub(r"\busd\b", "USD", q)
+    q = re.sub(r"\bgbp\b", "GBP", q)
+    q = re.sub(r"\beur\b", "EUR", q)
+    q = re.sub(r"\bcad\b", "CAD", q)
+    q = re.sub(r"\baud\b", "AUD", q)
+    q = re.sub(r"\bjpy\b", "JPY", q)
+    return q
 
 
 def _is_branded(query: str, brand: str, title: str) -> bool:
@@ -159,6 +324,18 @@ def _parse_queries(raw: str) -> list[str]:
     return lines[:8]
 
 
+def _clean_queries(queries: list[str], product: Product) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        q = _clean_query_text(query, product)
+        if len(q) <= 5 or q in seen:
+            continue
+        cleaned.append(q)
+        seen.add(q)
+    return cleaned
+
+
 async def generate_queries(product: Product) -> list[str]:
     client = GenerationClient()
     bullets_text = "\n".join(f"  - {b}" for b in product.bullets[:6]) if product.bullets else "  N/A"
@@ -182,7 +359,7 @@ async def generate_queries(product: Product) -> list[str]:
     candidates: list[str] = []
     for attempt in range(2):
         raw = await client.query(prompt, system=_SYSTEM)
-        parsed = _parse_queries(raw)
+        parsed = _clean_queries(_parse_queries(raw), product)
         candidates = [q for q in parsed if not _is_branded(q, product.brand, product.title)]
         if len(candidates) >= 6:
             return candidates[:6]
@@ -190,9 +367,11 @@ async def generate_queries(product: Product) -> list[str]:
             prompt += "\n\nMust return exactly 8 queries. No brand names. Use real numbers from the specs."
 
     seen = {q.lower() for q in candidates}
-    for fb in _FALLBACKS:
+    for fb in _fallbacks_for(product):
         if len(candidates) >= 6:
             break
+        fb = _clean_query_text(fb, product)
         if fb.lower() not in seen:
             candidates.append(fb)
+            seen.add(fb.lower())
     return candidates[:6]
