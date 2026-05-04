@@ -1,106 +1,123 @@
-# AI Visibility Grader
+# AI Visibility Grader (Amazon)
 
-**Is your Amazon product invisible to AI shoppers?**
+**How visible is your product to AI shopping assistants — and how do you improve it?**
 
-Type your brand and product name. Get a 0-100 score showing how often Llama, Gemini, and other AI models recommend your brand when real shoppers ask buying questions -- plus 5 specific listing fixes. No ASIN, no account, no friction.
-
----
-
-## Try it live
-
-**[ai-visibility-grader.vercel.app](https://ai-visibility-grader.vercel.app)**
-
-> First request may take 10-15 s while the Render backend wakes from sleep.
+This project analyzes an Amazon product and estimates how often it appears in AI-generated recommendations (LLMs like Llama/Gemini), then suggests concrete listing improvements.
 
 ---
 
-![AI Visibility Grader screenshot](docs/hero.png)
+## What this does
+
+Given an **exact Amazon product URL or ASIN**, the system:
+
+1. Fetches the real product listing (title, features, category, etc.)
+2. Generates realistic buyer-intent queries (non-branded)
+3. Asks multiple LLMs what products they would recommend
+4. Checks whether your product/brand appears
+5. Scores visibility (0–100)
+6. Identifies competitors winning those queries
+7. Generates actionable listing improvements
 
 ---
 
-## Why this matters
+## Why exact URL / ASIN is required
 
-Research suggests 20-30% of online shoppers now ask an AI assistant before visiting Amazon. If your brand does not appear in those responses, you are invisible before the shopping journey begins. Traditional listing optimisation (keywords, images, reviews) does not automatically translate into AI recommendation signals. This tool makes the gap measurable.
+Early versions used:
 
----
+brand + product title → Amazon search → closest match
 
-## What you get
+This introduced non-deterministic entity resolution.
 
-- **AI Visibility Score (0-100)** -- how often all three AI models recommend your brand across 10 buyer queries
-- **Per-model breakdown** -- separate scores for Llama 3.3 70B, Llama 3.1 8B, and Gemini
-- **Query-level table** -- which queries you won, which you lost, and at what position
-- **Top competitors** -- the 5 brands beating you most, ranked by mention frequency
-- **5 specific recommendations** -- grounded in the exact queries you lost and the attributes your competitors have that you do not
+“Closest match” could be:
+- the bundle, not the product  
+- the warranty, not the item  
+- or the wrong variant altogether  
 
----
+The pipeline didn’t fail —  
+it ran correctly on the wrong entity.
 
-## Architecture
+Fix:
+→ enforce **deterministic identifiers (ASIN / URL)**
 
-```
-+----------------------------------------------------------+
-|  Frontend (Next.js 14, Vercel)                           |
-|  { brand, title } -> POST /diagnose -> DiagnoseResponse  |
-+-------------------------+--------------------------------+
-                          |
-+-------------------------v--------------------------------+
-|  Backend (FastAPI, Render)                               |
-|                                                          |
-|  1. ProductFetcher    brand+title -> real Amazon listing  |
-|                       (search scrape -> ASIN -> scrape)  |
-|  2. QueryGenerator    Product -> 10 generic buyer queries |
-|                       (no brand/model names in queries)  |
-|  3. LLMRunner         10 queries x 3 models = 30 calls   |
-|                       (asyncio.gather, fully parallel)    |
-|  4. ResponseParser    30 responses -> structured JSON     |
-|                       (batched: 10 LLM calls total)      |
-|  5. Scorer            Weighted position scoring -> 0-100  |
-|                       (brand filtered from competitors)  |
-|  6. Recommender       Diagnostic data -> 5 fixes          |
-|                       (Gemini first, Groq fallback)      |
-+----------------------------------------------------------+
-```
+> If product identity is wrong, everything downstream becomes meaningless.
 
 ---
 
-## Engineering decisions
+## Live Demo
 
-**No ASIN input -- brand and product name instead.**
-ASINs create friction and require a separate lookup step that frequently fails on cloud IPs. Taking brand and product name directly lets the backend search for the real Amazon listing (scraping the search results page for an ASIN, then scraping the product page), or fall back to a stub product that is still sufficient to generate accurate buyer queries. Zero user friction, same data quality.
+https://ai-visibility-grader.vercel.app
 
-**Why Groq + OpenRouter instead of OpenAI?**
-Groq serves Llama 3.3 70B with sub-second token generation on free-tier credits. OpenRouter acts as a fallback when Groq is rate-limited. A circuit breaker (`llm_clients/_health.py`) tracks per-model failure timestamps with a 35-second cooldown, so a single rate-limit event does not cascade into a failed request.
-
-**Why batch the parser to 10 calls instead of 30?**
-The original design made one LLM call per model response (30 total). Batching all three responses into one parsing call per query cuts the parsing phase from 30 calls to 10, saving ~20 seconds with no accuracy loss.
-
-**Why Gemini first for recommendations?**
-The 30 scoring calls and 10 parse calls burn through Groq quota. By the time recommendations run, Groq is often rate-limited and requires retries. Routing the single recommendations call to Gemini (which has untouched quota) cuts that step from 15-25 seconds to 3-5 seconds.
-
-**Why asyncio.gather for the 30 LLM calls?**
-All 30 query-by-model combinations are independent. Running them in parallel means the scoring phase is bounded by the slowest single call (~8 s) rather than the sum (~5 min sequential). A semaphore (`asyncio.Semaphore(4)`) on GenerationClient prevents TPM bursts during the parse phase.
-
-**Why position-weighted scoring?**
-Ranking 1st in an AI response is meaningfully better than ranking 5th. Weights: 1st=1.0, 2nd=0.7, 3rd=0.5, 4th+=0.3, mentioned without rank=0.25. The 0.25 weight handles prose responses where position is ambiguous rather than penalising them as zero.
-
-**Why filter brand names out of queries?**
-Queries that include the product name (e.g. "Galaxy S25 vs iPhone 14") test brand recognition, not AI visibility. The query generator is instructed to produce generic buyer-intent queries, and a post-generation filter (`_is_branded`) strips any that slip through using brand token matching and model-number detection with unit-suffix exclusions (50mp, 12gb, etc. pass through; S25, A54 do not).
+(First request may take ~10–15s due to backend cold start)
 
 ---
 
-## Cost and latency
+## Architecture Overview
 
-All providers used are free tier.
+Frontend (Next.js)  
+→ submits ASIN / URL  
 
-| Phase | Provider | Calls | Typical latency |
-|---|---|---|---|
-| Product search | Amazon scrape | 1-2 | 2-5 s |
-| Query generation | Groq (Llama 3.3 70B) | 1 | ~2 s |
-| LLM scoring | Groq + Gemini | 30 parallel | ~8-10 s |
-| Response parsing | Groq (Llama 3.3 70B) | 10 parallel | ~20-30 s |
-| Recommendations | Gemini Flash | 1 | ~4 s |
-| **Total** | | **42+ calls** | **~60-100 s** |
+Backend (FastAPI)
 
-End-to-end cost per run is effectively $0 on free tiers.
+1. Product Fetcher  
+   → resolve ASIN + marketplace  
+   → fetch product data via provider chain  
+
+2. Query Generator (LLM)  
+   → generate 10 generic buyer queries  
+
+3. LLM Runner  
+   → ask multiple models (parallel)  
+   → collect recommendations  
+
+4. Parser (LLM)  
+   → structure responses into ranked product lists  
+
+5. Scorer  
+   → compute visibility score (position-weighted)  
+
+6. Recommender (LLM)  
+   → generate listing improvements  
+
+---
+
+## Product Data Layer
+
+Reliable product lookup is critical.
+
+Provider chain:
+
+1. Canopy API (primary)  
+2. Keepa (fallback)  
+3. Rainforest API (fallback)  
+4. Amazon scraping (last resort / dev fallback)  
+
+---
+
+## Marketplace Handling
+
+- ASINs are **marketplace-specific**
+- Same ASIN may exist in India but not in the US
+
+Rules:
+- If input = URL → infer marketplace from domain (amazon.in, amazon.com)
+- If input = raw ASIN → use AMAZON_MARKETPLACE (default: IN)
+
+---
+
+## Cost & Latency
+
+This is a multi-step LLM pipeline.
+
+Typical run:
+- ~40+ LLM calls  
+- Multiple providers  
+- Parallel execution  
+
+Latency:
+~60–100 seconds (free tier)
+
+Tradeoff:
+quality vs cost vs latency
 
 ---
 
@@ -110,134 +127,158 @@ End-to-end cost per run is effectively $0 on free tiers.
 
 - Python 3.11+
 - Node.js 18+
-- Groq API key (free at console.groq.com)
-- Google Gemini API key (free at aistudio.google.com)
 
-### Backend
-
-```bash
-cd backend
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env          # fill in GROQ_API_KEY and GOOGLE_API_KEY
-uvicorn main:app --reload --port 8000
-```
-
-### Frontend
-
-```bash
-cd frontend
-npm install
-cp .env.local.example .env.local
-npm run dev
-```
-
-Open `http://localhost:3000`.
+Accounts (free tiers):
+- Groq
+- Google AI Studio (Gemini)
+- (Optional) Canopy / Keepa / Rainforest
 
 ---
 
-## Environment variables
+## Backend
 
-### Backend (`backend/.env`)
+cd backend
 
-| Variable | Required | Description |
-|---|---|---|
-| `GROQ_API_KEY` | Yes | Llama 3.3 70B and 3.1 8B -- query gen, parsing |
-| `GOOGLE_API_KEY` | Yes | Gemini 1.5 Flash -- scoring + recommendations |
-| `OPENROUTER_API_KEY` | No | Fallback when Groq is rate-limited |
-| `RAINFOREST_API_KEY` | No | Reliable product lookup on cloud deployments |
+python -m venv .venv  
+source .venv/bin/activate   (Windows: .venv\Scripts\activate)
 
-### Frontend (`frontend/.env.local`)
+pip install -r requirements.txt  
+cp .env.example .env  
 
-| Variable | Default | Description |
-|---|---|---|
-| `NEXT_PUBLIC_API_URL` | `http://localhost:8000` | Backend URL |
+uvicorn main:app --reload --port 8000  
+
+---
+
+## Frontend
+
+cd frontend  
+
+npm install  
+cp .env.local.example .env.local  
+
+npm run dev  
+
+Open http://localhost:3000
+
+---
+
+## Environment Variables
+
+### backend/.env
+
+GROQ_API_KEY=  
+GOOGLE_API_KEY=  
+CANOPY_API_KEY=  
+KEEPA_API_KEY=  
+RAINFOREST_API_KEY=  
+AMAZON_MARKETPLACE=IN  
+
+---
+
+### frontend/.env.local
+
+NEXT_PUBLIC_API_URL=http://localhost:8000
+
+---
+
+## API
+
+POST /diagnose
+
+Request:
+{
+  "input": "https://amazon.in/dp/B0XXXX"
+}
+
+or
+
+{
+  "input": "B0XXXX"
+}
+
+---
+
+Response (simplified):
+
+{
+  "score": 62,
+  "model_scores": {
+    "llama70b": 70,
+    "llama8b": 55,
+    "gemini": 61
+  },
+  "competitors": ["BrandA", "BrandB"],
+  "recommendations": [
+    "Improve feature clarity",
+    "Add comparison-friendly attributes"
+  ]
+}
 
 ---
 
 ## Deployment
 
-### Backend (Render free tier)
+### Backend (Render)
 
-1. Push repo to GitHub
-2. New Web Service on Render, root: `backend/`
-3. Build: `pip install -r requirements.txt`
-4. Start: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-5. Add `GROQ_API_KEY` and `GOOGLE_API_KEY` in environment variables
+- Root: backend/
+- Build: pip install -r requirements.txt
+- Start: uvicorn main:app --host 0.0.0.0 --port $PORT
+- Add env variables
+
+---
 
 ### Frontend (Vercel)
 
-1. Import repo into Vercel, root directory: `frontend/`
-2. Add `NEXT_PUBLIC_API_URL` pointing to your Render URL
-3. Deploy
+- Root: frontend/
+- Add NEXT_PUBLIC_API_URL
+- Deploy
 
 ---
 
-## Scoring
+## Troubleshooting
 
-```
-Per model score:
-  sum(position_weight) / total_queries x 100
-
-Weights: 1st=1.0  2nd=0.7  3rd=0.5  4th+=0.3  mention(no rank)=0.25  not mentioned=0.0
-
-Overall = average(llama70b, llama8b, gemini)
-```
+### Product not found
+- Check marketplace mismatch (IN vs US)
+- Try full URL instead of ASIN
+- Ensure provider API keys are set
 
 ---
 
-## Repo structure
-
-```
-ai-visibility-grader/
-+-- backend/
-|   +-- main.py                  # FastAPI app, /diagnose endpoint
-|   +-- models.py                # Pydantic schemas
-|   +-- services/
-|   |   +-- product_fetcher.py   # brand+title -> real Amazon listing
-|   |   +-- query_generator.py   # Product -> 10 generic buyer queries
-|   |   +-- llm_runner.py        # 30 parallel LLM scoring calls
-|   |   +-- parser.py            # Batched LLM extraction (10 calls)
-|   |   +-- scorer.py            # Weighted position scoring
-|   |   +-- recommender.py       # 5 improvement recommendations (Gemini-first)
-|   +-- llm_clients/
-|   |   +-- _health.py           # Circuit breaker (35s cooldown per model)
-|   |   +-- groq_client.py       # Llama 3.3 70B + 3.1 8B
-|   |   +-- openrouter_client.py # Fallback free models
-|   |   +-- gemini_client.py     # Gemini 1.5 Flash
-|   |   +-- generation_client.py # Health-aware provider router
-|   +-- requirements.txt
-|   +-- .env.example
-+-- frontend/
-|   +-- app/
-|   |   +-- page.tsx             # Landing page + report view
-|   +-- components/
-|   |   +-- ScoreHero.tsx
-|   |   +-- ModelCard.tsx
-|   |   +-- QueryTable.tsx
-|   |   +-- CompetitorList.tsx
-|   |   +-- RecommendationCard.tsx
-|   |   +-- LoadingScreen.tsx
-|   +-- lib/api.ts               # Backend API client
-|   +-- .env.local.example
-+-- docs/
-|   +-- hero.png
-+-- LICENSE
-+-- README.md
-```
+### Provider API failures
+- Check quotas / billing
+- Verify API keys
+- Look for 402 / auth errors
 
 ---
 
-## Roadmap
+### Scraping issues
+- Amazon blocks cloud IPs
+- Scraping is not reliable in production
+→ Use provider APIs
 
-- **SSE progress stream** -- real pipeline state in the loading screen instead of estimated timings
-- **Persistent reports** -- Postgres + shareable URL per diagnostic run
-- **Scheduled re-runs** -- weekly re-score with email delta to track visibility over time
-- **Comparison mode** -- two brands side-by-side with diff highlighting
-- **Multi-language** -- swap the query generator prompt; the rest of the pipeline is language-agnostic
+---
+
+### Slow diagnostics
+- Expected due to multiple LLM calls
+- Free-tier latency adds up
+
+---
+
+### LLM rate limits
+- Providers may throttle
+- Retry or add fallback providers
+
+---
+
+## Engineering Notes
+
+- Exact product identity > fuzzy UX
+- AI systems fail silently with bad input
+- Surface provider errors, don’t hide them
+- Latency is a core product constraint
 
 ---
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT
