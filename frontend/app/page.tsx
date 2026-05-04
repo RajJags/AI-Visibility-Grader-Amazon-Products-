@@ -12,14 +12,13 @@ import RecommendationCard from "@/components/RecommendationCard";
 // ── State machine ─────────────────────────────────────────────────────────────
 type State =
   | { status: "idle" }
-  | { status: "loading"; productName: string }
+  | { status: "loading"; productTitle: string }
   | { status: "result"; data: DiagnoseResponse }
   | { status: "error"; message: string };
 
 // ── Root component ────────────────────────────────────────────────────────────
 export default function Home() {
-  const [brand, setBrand]   = useState("");
-  const [title, setTitle]   = useState("");
+  const [listingInput, setListingInput] = useState("");
   const [state, setState]   = useState<State>({ status: "idle" });
 
   // Warm up the Render backend on page load to reduce cold-start delay
@@ -29,12 +28,11 @@ export default function Home() {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    const b = brand.trim();
-    const t = title.trim();
-    if (!b || !t) return;
-    setState({ status: "loading", productName: t });
+    const listing = listingInput.trim();
+    if (!listing) return;
+    setState({ status: "loading", productTitle: "Amazon listing" });
     try {
-      const data = await runDiagnostic({ brand: b, title: t });
+      const data = await runDiagnostic({ asin: listing });
       setState({ status: "result", data });
     } catch (err) {
       setState({
@@ -46,12 +44,11 @@ export default function Home() {
 
   function reset() {
     setState({ status: "idle" });
-    setBrand("");
-    setTitle("");
+    setListingInput("");
   }
 
   if (state.status === "loading") {
-    return <LoadingScreen productName={state.productName} />;
+    return <LoadingScreen productTitle={state.productTitle} />;
   }
 
   if (state.status === "result") {
@@ -88,21 +85,14 @@ export default function Home() {
           <form onSubmit={handleSubmit} className="flex flex-col gap-3 max-w-lg">
             <input
               type="text"
-              value={brand}
-              onChange={(e) => setBrand(e.target.value)}
-              placeholder="Brand name  (e.g. Samsung)"
-              className="border border-neutral-200 rounded-xl px-4 h-12 text-sm text-neutral-900 placeholder-neutral-400 focus:outline-none focus:border-accent transition-colors"
-            />
-            <input
-              type="text"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              placeholder="Product name  (e.g. Galaxy S25 5G Smartphone)"
+              value={listingInput}
+              onChange={(e) => setListingInput(e.target.value)}
+              placeholder="Amazon product URL or ASIN"
               className="border border-neutral-200 rounded-xl px-4 h-12 text-sm text-neutral-900 placeholder-neutral-400 focus:outline-none focus:border-accent transition-colors"
             />
             <button
               type="submit"
-              disabled={!brand.trim() || !title.trim()}
+              disabled={!listingInput.trim()}
               className="h-12 px-6 bg-accent hover:bg-accent-hover disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold rounded-xl text-sm transition-colors"
             >
               Run Diagnostic
@@ -128,17 +118,17 @@ export default function Home() {
               {
                 n: "01",
                 title: "Enter your product",
-                body: "Type your brand and product name. No account or ASIN needed.",
+                body: "Paste the Amazon product URL or ASIN so the exact listing is fetched.",
               },
               {
                 n: "02",
                 title: "3 AI models answer",
-                body: "Llama 3.3, Llama 3.1, and Gemini each answer 10 realistic buyer queries about your category.",
+                body: "Llama 3.3, Llama 3.1, and Gemini each answer 6 realistic buyer queries about your category.",
               },
               {
                 n: "03",
                 title: "Score + action plan",
-                body: "Get a 0–100 AI Visibility Score, competitor analysis, and 5 specific fixes.",
+                body: "Get a 0–100 AI Visibility Score, competitor analysis, and 3 specific fixes.",
               },
             ].map(({ n, title, body }) => (
               <div key={n} className="border border-neutral-200 rounded-xl p-8">
@@ -215,9 +205,10 @@ function ReportView({ data, onReset }: { data: DiagnoseResponse; onReset: () => 
         {/* Score hero */}
         <ScoreHero
           score={score.overall}
-          brand={product.brand}
+          productTitle={product.title}
           mentionedIn={mentionedIn}
           totalQueries={totalQueries}
+          queriesUsed={score.queries_used}
         />
 
         {/* Per-model scores */}

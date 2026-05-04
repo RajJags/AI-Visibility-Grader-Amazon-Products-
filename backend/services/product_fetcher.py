@@ -1,5 +1,5 @@
 """
-ProductFetcher  -  resolves an ASIN to a Product.
+ProductFetcher  -  resolves an exact Amazon URL/ASIN to a Product.
 
 Resolution order:
   1. Rainforest API  (if RAINFOREST_API_KEY is set  -  reliable on any server)
@@ -17,8 +17,24 @@ from bs4 import BeautifulSoup
 from models import Product
 
 _STUB_CATEGORY = "Health & Household"
+_DEFAULT_MARKETPLACE = os.environ.get("AMAZON_MARKETPLACE", "IN").upper()
 _IS_CLOUD = bool(os.environ.get("RENDER") or os.environ.get("RAILWAY_ENVIRONMENT")
                  or os.environ.get("FLY_APP_NAME") or os.environ.get("DYNO"))
+
+_HOST_TO_MARKETPLACE = {
+    "amazon.com": "US",
+    "amazon.in": "IN",
+    "amazon.co.uk": "UK",
+    "amazon.ca": "CA",
+    "amazon.de": "DE",
+    "amazon.fr": "FR",
+    "amazon.it": "IT",
+    "amazon.es": "ES",
+    "amazon.com.au": "AU",
+    "amazon.co.jp": "JP",
+}
+
+_MARKETPLACE_TO_HOST = {v: k for k, v in _HOST_TO_MARKETPLACE.items()}
 
 _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -28,34 +44,237 @@ _USER_AGENTS = [
 ]
 
 
+class ProductFetchError(RuntimeError):
+    """Raised when exact listing lookup cannot run because a provider is unavailable."""
+
+
+def _provider_error(provider: str, status: int, detail: str = "") -> ProductFetchError:
+    suffix = f": {detail}" if detail else "."
+    return ProductFetchError(f"{provider} product lookup is unavailable (HTTP {status}){suffix}")
+
+
 def _extract_asin(raw: str) -> str:
     raw = raw.strip()
-    m = re.search(r"(?:/dp/|/gp/product/)([A-Z0-9]{10})", raw)
+    m = re.search(r"(?:/dp/|/gp/product/)([a-z0-9]{10})", raw, flags=re.IGNORECASE)
     if m:
-        return m.group(1)
-    if re.fullmatch(r"[A-Z0-9]{10}", raw):
-        return raw
+        return m.group(1).upper()
+    if re.fullmatch(r"[a-z0-9]{10}", raw, flags=re.IGNORECASE):
+        return raw.upper()
     raise ValueError(f"Could not parse ASIN from: {raw!r}")
+
+
+def _extract_marketplace(raw: str) -> str:
+    host_match = re.search(r"https?://(?:www\.)?([^/]+)", raw.strip(), flags=re.IGNORECASE)
+    if not host_match:
+        return _DEFAULT_MARKETPLACE
+    host = host_match.group(1).lower()
+    return _HOST_TO_MARKETPLACE.get(host, _DEFAULT_MARKETPLACE)
+
+
+def _extract_listing(raw: str) -> tuple[str, str]:
+    return _extract_asin(raw), _extract_marketplace(raw)
+
+
+def _amazon_domain(marketplace: str) -> str:
+    return _MARKETPLACE_TO_HOST.get(marketplace.upper(), "amazon.in")
+
+
+# Canopy
+
+def _first_string(*values) -> str:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _first_image_url(value) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+            if isinstance(item, dict):
+                url = _first_string(item.get("url"), item.get("link"), item.get("large"), item.get("hiRes"))
+                if url:
+                    return url
+    if isinstance(value, dict):
+        return _first_string(value.get("url"), value.get("link"), value.get("large"), value.get("hiRes")) or None
+    return None
+
+
+def _canopy_bullets(product: dict) -> list[str]:
+    for key in ("features", "featureBullets", "feature_bullets", "bullets"):
+        value = product.get(key)
+        if isinstance(value, list):
+            return [str(item) for item in value[:10] if str(item).strip()]
+    description = product.get("description")
+    if isinstance(description, list):
+        return [str(item) for item in description[:10] if str(item).strip()]
+    if isinstance(description, str) and description.strip():
+        return [description.strip()]
+    return []
+
+
+def _canopy_category(product: dict) -> str:
+    category = product.get("category") or product.get("productCategory") or product.get("productGroup")
+    if isinstance(category, str) and category.strip():
+        return category.strip()
+    breadcrumbs = product.get("breadcrumbs") or product.get("categories")
+    if isinstance(breadcrumbs, list):
+        for item in breadcrumbs:
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+            if isinstance(item, dict):
+                name = _first_string(item.get("name"), item.get("title"))
+                if name:
+                    return name
+    return _STUB_CATEGORY
+
+
+def _fetch_canopy_sync(asin: str, marketplace: str) -> dict:
+    api_key = os.environ.get("CANOPY_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("CANOPY_API_KEY not set")
+    params = {"asin": asin, "domain": marketplace.upper()}
+    headers = {"API-KEY": api_key, "Accept": "application/json"}
+    with httpx.Client(timeout=25) as client:
+        resp = client.get("https://rest.canopyapi.co/api/amazon/product", params=params, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _try_canopy(asin: str, marketplace: str) -> Product | None:
+    try:
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, _fetch_canopy_sync, asin, marketplace)
+        product = (
+            data.get("product")
+            if isinstance(data.get("product"), dict)
+            else (data.get("data") or {}).get("amazonProduct")
+            if isinstance(data.get("data"), dict)
+            else data
+        )
+        if not isinstance(product, dict):
+            return None
+        title = _first_string(product.get("title"), product.get("productTitle"), product.get("name"))
+        if not title:
+            return None
+        image_url = _first_image_url(
+            product.get("imageUrl") or product.get("mainImage") or product.get("images") or product.get("image")
+        )
+        return Product(
+            asin=_first_string(product.get("asin"), data.get("asin")) or asin,
+            brand=_first_string(product.get("brand"), product.get("manufacturer")) or "Unknown Brand",
+            title=title,
+            category=_canopy_category(product),
+            bullets=_canopy_bullets(product),
+            image_url=image_url,
+        )
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status in (400, 401, 402, 403, 429):
+            detail = ""
+            try:
+                body = exc.response.json()
+                detail = str(body.get("message") or body.get("error") or body.get("detail") or "")[:240]
+            except Exception:
+                pass
+            raise _provider_error("Canopy", status, detail) from exc
+        return None
+    except Exception:
+        return None
+
+
+# Keepa
+
+def _keepa_image_url(images_csv: str | None) -> str | None:
+    if not images_csv:
+        return None
+    first = images_csv.split(",")[0].strip()
+    if not first:
+        return None
+    return f"https://m.media-amazon.com/images/I/{first}"
+
+
+def _keepa_category(product: dict) -> str:
+    category_tree = product.get("categoryTree") or []
+    if category_tree and isinstance(category_tree[0], dict):
+        return category_tree[0].get("name") or _STUB_CATEGORY
+    return product.get("productGroup") or _STUB_CATEGORY
+
+
+def _fetch_keepa_sync(asin: str) -> dict:
+    api_key = os.environ.get("KEEPA_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("KEEPA_API_KEY not set")
+    params = {
+        "key": api_key,
+        "domain": 1,
+        "asin": asin,
+        "history": 0,
+        "stats": 0,
+    }
+    with httpx.Client(timeout=20) as client:
+        resp = client.get("https://api.keepa.com/product", params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _try_keepa(asin: str) -> Product | None:
+    try:
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, _fetch_keepa_sync, asin)
+        products = data.get("products") or []
+        if not products:
+            return None
+        prod = products[0]
+        title = prod.get("title") or ""
+        if not title:
+            return None
+        bullets = prod.get("features") or []
+        return Product(
+            asin=prod.get("asin") or asin,
+            brand=prod.get("brand") or "Unknown Brand",
+            title=title,
+            category=_keepa_category(prod),
+            bullets=[str(b) for b in bullets[:10]],
+            image_url=_keepa_image_url(prod.get("imagesCSV")),
+        )
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status in (401, 402, 403, 429):
+            detail = ""
+            try:
+                body = exc.response.json()
+                detail = str(body.get("error") or body.get("message") or "")[:240]
+            except Exception:
+                pass
+            raise _provider_error("Keepa", status, detail) from exc
+        return None
+    except Exception:
+        return None
 
 
 # ── Rainforest ────────────────────────────────────────────────────────────────
 
-def _fetch_rainforest_sync(asin: str) -> dict:
+def _fetch_rainforest_sync(asin: str, marketplace: str) -> dict:
     api_key = os.environ.get("RAINFOREST_API_KEY", "")
     if not api_key:
         raise RuntimeError("RAINFOREST_API_KEY not set")
     params = {"api_key": api_key, "type": "product", "asin": asin,
-              "amazon_domain": "amazon.com"}
+              "amazon_domain": _amazon_domain(marketplace)}
     with httpx.Client(timeout=15) as client:
         resp = client.get("https://api.rainforestapi.com/request", params=params)
         resp.raise_for_status()
         return resp.json()
 
 
-async def _try_rainforest(asin: str) -> Product | None:
+async def _try_rainforest(asin: str, marketplace: str) -> Product | None:
     try:
         loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, _fetch_rainforest_sync, asin)
+        data = await loop.run_in_executor(None, _fetch_rainforest_sync, asin, marketplace)
         prod = data.get("product", {})
         if not prod:
             return None
@@ -70,14 +289,22 @@ async def _try_rainforest(asin: str) -> Product | None:
         image_url = (prod.get("main_image") or {}).get("link")
         return Product(asin=asin, brand=brand, title=title, category=category,
                        bullets=bullets[:10], image_url=image_url)
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status in (401, 402, 403, 429):
+            raise ProductFetchError(
+                f"Amazon listing lookup provider is unavailable (Rainforest API returned HTTP {status}). "
+                "Check the Rainforest account/API key, then retry with the same ASIN or Amazon URL."
+            ) from exc
+        return None
     except Exception:
         return None
 
 
 # ── Amazon scrape ─────────────────────────────────────────────────────────────
 
-async def _scrape_amazon(asin: str) -> Product | None:
-    url = f"https://www.amazon.com/dp/{asin}"
+async def _scrape_amazon(asin: str, marketplace: str) -> Product | None:
+    url = f"https://www.{_amazon_domain(marketplace)}/dp/{asin}"
     headers = {
         "User-Agent": _USER_AGENTS[hash(asin) % len(_USER_AGENTS)],
         "Accept-Language": "en-US,en;q=0.9",
@@ -147,106 +374,15 @@ async def _scrape_amazon(asin: str) -> Product | None:
 
 
 
-async def _try_rainforest_search(brand: str, title: str) -> Product | None:
-    """Use Rainforest search endpoint to find the best-matching product."""
-    api_key = os.environ.get('RAINFOREST_API_KEY', '')
-    if not api_key:
-        return None
-    try:
-        loop = asyncio.get_event_loop()
-        def _call():
-            params = {
-                'api_key': api_key,
-                'type': 'search',
-                'amazon_domain': 'amazon.com',
-                'search_term': f'{brand} {title}',
-            }
-            with httpx.Client(timeout=12) as client:
-                resp = client.get('https://api.rainforestapi.com/request', params=params)
-                resp.raise_for_status()
-                return resp.json()
-        data = await loop.run_in_executor(None, _call)
-        results = data.get('search_results', [])
-        if not results:
-            return None
-        top = results[0]
-        asin = top.get('asin', '')
-        if not asin:
-            return None
-        # Now fetch the full product page
-        return await _try_rainforest(asin)
-    except Exception:
-        return None
-
-# ── Amazon search by brand+title ──────────────────────────────────────────────
-
-async def _search_and_fetch(brand: str, title: str) -> Product | None:
-    """Search Amazon for brand+title, extract the first ASIN, then scrape it."""
-    query = f"{brand} {title}".strip()
-    url = "https://www.amazon.com/s?k=" + query.replace(" ", "+")
-    headers = {
-        "User-Agent": _USER_AGENTS[hash(query) % len(_USER_AGENTS)],
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-    }
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=8, headers=headers) as client:
-            resp = await client.get(url)
-            if resp.status_code != 200:
-                return None
-            html = resp.text
-    except Exception:
-        return None
-
-    _parser = "lxml"
-    try:
-        import lxml  # noqa: F401
-    except ImportError:
-        _parser = "html.parser"
-    soup = BeautifulSoup(html, _parser)
-
-    # Extract first search result ASIN from data-asin attribute
-    asin = None
-    for el in soup.select("[data-asin]"):
-        val = el.get("data-asin", "")
-        if val and re.fullmatch(r"[A-Z0-9]{10}", val):
-            asin = val
-            break
-
-    if not asin:
-        return None
-
-    # Scrape the product page for the real title, bullets, category, image
-    product = await _scrape_amazon(asin)
-    return product
-
 # ── Public entry point ────────────────────────────────────────────────────────
 
 async def fetch_product(raw_input: str, manual_brand: str | None = None,
                         manual_title: str | None = None) -> Product:
-    # Brand+title provided: try to find the real Amazon listing first.
-    # This gives us real bullets, category, image, and canonical title.
-    # Fall back to a stub product if the search/scrape fails or is blocked.
-    if manual_brand and manual_title:
-        found = None
-        if not _IS_CLOUD:
-            # Local env: try Amazon search scrape (usually works)
-            found = await _search_and_fetch(manual_brand, manual_title)
-        if not found and bool(os.environ.get("RAINFOREST_API_KEY", "")):
-            # Cloud with Rainforest: use their search endpoint
-            found = await _try_rainforest_search(manual_brand, manual_title)
-        if found:
-            return found
-        # Fallback: stub with the user-provided data
-        try:
-            asin = _extract_asin(raw_input)
-        except ValueError:
-            asin = raw_input or "manual"
-        return Product(asin=asin, brand=manual_brand, title=manual_title,
-                       category=_STUB_CATEGORY, bullets=[], image_url=None)
-
+    # Exact listing mode only: raw_input must be a canonical product URL or ASIN.
+    # Brand/title search is intentionally disabled because it can select bundles,
+    # protection plans, accessories, or the wrong variant.
     try:
-        asin = _extract_asin(raw_input)
+        asin, marketplace = _extract_listing(raw_input)
     except ValueError:
         return Product(asin=raw_input, brand="MANUAL_ENTRY_REQUIRED",
                        title=raw_input, category=_STUB_CATEGORY,
@@ -256,18 +392,41 @@ async def fetch_product(raw_input: str, manual_brand: str | None = None,
     # On cloud without a Rainforest key, skip scraping entirely  -  Amazon blocks
     # cloud IP ranges almost immediately, so the 10-second timeout is dead time.
     # Return MANUAL_ENTRY_REQUIRED instantly; the frontend shows the entry form.
+    provider_errors: list[str] = []
+    product = None
+
+    if os.environ.get("CANOPY_API_KEY", ""):
+        try:
+            product = await _try_canopy(asin, marketplace)
+        except ProductFetchError as exc:
+            provider_errors.append(str(exc))
+
+    if not product and os.environ.get("KEEPA_API_KEY", ""):
+        try:
+            product = await _try_keepa(asin)
+        except ProductFetchError as exc:
+            provider_errors.append(str(exc))
+
     has_rainforest = bool(os.environ.get("RAINFOREST_API_KEY", ""))
-    if has_rainforest:
-        product = await _try_rainforest(asin) or await _scrape_amazon(asin)
-    elif _IS_CLOUD:
+    if not product and has_rainforest:
+        try:
+            product = await _try_rainforest(asin, marketplace)
+        except ProductFetchError as exc:
+            provider_errors.append(str(exc))
+            product = None
+        product = product or await _scrape_amazon(asin, marketplace)
+    elif not product and _IS_CLOUD:
         product = None  # scrape always blocked on cloud IPs; skip straight to manual form
-    else:
-        scraped = await _scrape_amazon(asin)
+    elif not product:
+        scraped = await _scrape_amazon(asin, marketplace)
         product = scraped if (scraped and scraped.brand != "Unknown Brand") else None
         product = product or scraped
 
     if product:
         return product
+
+    if provider_errors:
+        raise ProductFetchError(" ".join(provider_errors))
 
     return Product(asin=asin, brand="MANUAL_ENTRY_REQUIRED",
                    title=f"Product {asin}", category=_STUB_CATEGORY,
@@ -281,8 +440,7 @@ async def fetch_product_with_llm_fallback(
 ) -> Product:
     """
     Thin wrapper kept for API compatibility.
-    LLM ASIN guessing was removed  -  it hallucinated products.
-    If scraping + Rainforest both fail, returns MANUAL_ENTRY_REQUIRED
-    so the frontend can show the manual-entry form.
+    LLM ASIN guessing and brand/title search are intentionally disabled:
+    exact listing fetches require a URL or ASIN.
     """
     return await fetch_product(raw_input, manual_brand, manual_title)

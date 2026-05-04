@@ -2,7 +2,7 @@
 ResponseParser -- batched LLM parsing.
 
 One LLM call parses all 3 model responses per query.
-10 total calls for 10 queries (vs 30 in the original).
+6 total calls for 6 queries, all run concurrently.
 """
 
 from __future__ import annotations
@@ -12,8 +12,7 @@ from models import ModelMentions, ModelPositions, ParsedQueryResult, QueryResult
 
 _SYSTEM = "You are a structured data extraction assistant. Always respond with valid JSON only, no markdown, no explanation."
 
-_BATCH_PROMPT = """\
-Shopping query: "{query}"
+_BATCH_PROMPT = """Shopping query: "{query}"
 Target brand: "{brand}"
 
 Three AI shopping assistant responses are shown below. For each one, extract:
@@ -93,9 +92,9 @@ async def _parse_one(client, qr, brand):
     prompt = _BATCH_PROMPT.format(
         query=qr.query,
         brand=brand,
-        response_a=qr.gpt4_response[:1500]   if not is_err(qr.gpt4_response)   else "(no response)",
-        response_b=qr.claude_response[:1500]  if not is_err(qr.claude_response)  else "(no response)",
-        response_c=qr.gemini_response[:1500]  if not is_err(qr.gemini_response)  else "(no response)",
+        response_a=qr.gpt4_response[:1500]  if not is_err(qr.gpt4_response)  else "(no response)",
+        response_b=qr.claude_response[:1500] if not is_err(qr.claude_response) else "(no response)",
+        response_c=qr.gemini_response[:1500] if not is_err(qr.gemini_response) else "(no response)",
     )
 
     raw = await client.query(prompt, system=_SYSTEM)
@@ -138,6 +137,6 @@ async def _parse_one(client, qr, brand):
     )
 
 
-async def parse_query_results(results, brand):
+async def parse_query_results(results: list[QueryResult], brand: str) -> list[ParsedQueryResult]:
     client = GenerationClient()
     return list(await asyncio.gather(*[_parse_one(client, qr, brand) for qr in results]))

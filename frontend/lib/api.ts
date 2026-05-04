@@ -30,6 +30,7 @@ export interface Score {
   claude: number;
   gemini: number;
   top_competitors: Competitor[];
+  queries_used: number;  // may be < 10 if scoring phase hit timeout
 }
 
 export interface QuerySummary {
@@ -70,7 +71,8 @@ export class APIError extends Error {
 }
 
 export interface DiagnoseRequest {
-  asin?: string;   // optional -- omit when submitting brand+title directly
+  asin?: string;   // raw ASIN or Amazon product URL
+  amazon_url?: string;
   brand?: string;
   title?: string;
   category?: string;

@@ -11,7 +11,7 @@ interface Step {
 
 const STEPS: Step[] = [
   { id: "setup",   label: "Setting up product profile",    activeAt: 0,  doneAt: 4   },
-  { id: "queries", label: "Generating 10 buyer queries",   activeAt: 4,  doneAt: 14  },
+  { id: "queries", label: "Generating 6 buyer queries",    activeAt: 4,  doneAt: 14  },
   { id: "llm-a",  label: "Querying Llama 3.3 (70B)",      activeAt: 14, doneAt: 62  },
   { id: "llm-b",  label: "Querying Llama 3.1 (8B)",       activeAt: 14, doneAt: 62  },
   { id: "llm-c",  label: "Querying Gemini",                activeAt: 14, doneAt: 62  },
@@ -30,7 +30,7 @@ function getStatus(step: Step, elapsed: number): StepStatus {
   return "pending";
 }
 
-export default function LoadingScreen({ productName }: { productName?: string }) {
+export default function LoadingScreen({ productTitle }: { productTitle?: string }) {
   const [elapsed, setElapsed] = useState(0);
 
   useEffect(() => {
@@ -47,8 +47,8 @@ export default function LoadingScreen({ productName }: { productName?: string })
         <p className="text-xs font-semibold uppercase tracking-widest text-neutral-400 mb-3">
           Running diagnostic
         </p>
-        {productName && (
-          <p className="text-sm text-neutral-500 truncate">{productName}</p>
+        {productTitle && (
+          <p className="text-sm text-neutral-500 truncate">{productTitle}</p>
         )}
       </div>
 

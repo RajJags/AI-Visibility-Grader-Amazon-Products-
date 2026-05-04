@@ -1,9 +1,8 @@
 """
-LLMRunner  -  three scoring slots with concurrency control.
+LLMRunner -- three scoring slots with concurrency control.
 
-Semaphore limits to 4 simultaneous LLM calls so we don't blast through
-Groq's 6,000 TPM free-tier limit with 30 parallel requests.
-Slots are staggered slightly to spread the token load over time.
+Semaphore limits to 6 simultaneous LLM calls across all slots.
+Slots are staggered to spread token load over time.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ from models import QueryResult
 _SYSTEM = (
     "You are a helpful shopping assistant. "
     "Recommend 3-5 specific products by brand name with brief reasoning. "
-    "Be direct and specific  -  name the actual brands and products."
+    "Be direct and specific - name the actual brands and products."
 )
 
 _GROQ_LARGE = [
@@ -32,7 +31,6 @@ _GROQ_SMALL = [
     "qwen/qwen3-32b",
 ]
 
-# Max simultaneous LLM calls across all slots
 _SEM = asyncio.Semaphore(6)
 
 
@@ -74,13 +72,10 @@ async def run_all_queries(queries: list[str]) -> list[QueryResult]:
     slot_c = _SlotClient(_GROQ_SMALL, gemini_first=True)
 
     n = len(queries)
-
-    # Stagger slots: slot B starts 1s later, slot C starts 2s later
-    # so we don't hit 30 concurrent requests at t=0
     tasks = (
-        [_query_safe(slot_a, q, delay=0.0)         for q in queries] +
-        [_query_safe(slot_b, q, delay=1.0)         for q in queries] +
-        [_query_safe(slot_c, q, delay=2.0)         for q in queries]
+        [_query_safe(slot_a, q, delay=0.0) for q in queries] +
+        [_query_safe(slot_b, q, delay=1.0) for q in queries] +
+        [_query_safe(slot_c, q, delay=2.0) for q in queries]
     )
     all_responses = await asyncio.gather(*tasks)
 

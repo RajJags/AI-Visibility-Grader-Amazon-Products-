@@ -55,6 +55,8 @@ class Score(BaseModel):
     claude: int = Field(ge=0, le=100)
     gemini: int = Field(ge=0, le=100)
     top_competitors: list[Competitor] = Field(default_factory=list)
+    # How many queries were actually scored (may be < 10 if timeout hit)
+    queries_used: int = 10
 
 
 class Recommendation(BaseModel):
@@ -64,15 +66,16 @@ class Recommendation(BaseModel):
 
 
 class DiagnoseRequest(BaseModel):
-    # asin is optional -- frontend now submits brand+title directly
+    # Exact listing identifier: accepts a raw ASIN or an Amazon product URL.
     asin: Optional[str] = Field(default=None)
+    amazon_url: Optional[str] = None
     brand: Optional[str] = None
     title: Optional[str] = None
     category: Optional[str] = None
 
     @property
-    def has_product_info(self) -> bool:
-        return bool(self.brand and self.title)
+    def listing_input(self) -> Optional[str]:
+        return self.amazon_url or self.asin
 
 
 class QuerySummary(BaseModel):

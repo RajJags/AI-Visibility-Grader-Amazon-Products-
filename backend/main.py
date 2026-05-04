@@ -1,15 +1,16 @@
 """AI Visibility Grader -- FastAPI backend. Single endpoint: POST /diagnose"""
 from __future__ import annotations
 import os
+from pathlib import Path
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(Path(__file__).with_name(".env"))
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from models import DiagnoseRequest, DiagnoseResponse, QuerySummary
-from services.product_fetcher import fetch_product_with_llm_fallback as fetch_product
+from services.product_fetcher import ProductFetchError, fetch_product_with_llm_fallback as fetch_product
 from services.query_generator import generate_queries
 from services.llm_runner import run_all_queries
 from services.parser import parse_query_results
@@ -20,7 +21,8 @@ from services.recommender import generate_recommendations
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configured = [k for k in ("GROQ_API_KEY", "OPENROUTER_API_KEY", "GOOGLE_API_KEY",
-                               "RAINFOREST_API_KEY") if os.environ.get(k)]
+                               "CANOPY_API_KEY", "KEEPA_API_KEY", "RAINFOREST_API_KEY")
+                  if os.environ.get(k)]
     missing = [k for k in ("GROQ_API_KEY",) if not os.environ.get(k)]
     print(f"[startup] providers configured: {configured or 'none'}")
     if missing:
@@ -46,21 +48,20 @@ async def health():
 
 @app.post("/diagnose", response_model=DiagnoseResponse)
 async def diagnose(request: DiagnoseRequest):
-    # Require at least brand+title or a resolvable asin
-    if not request.has_product_info and not request.asin:
+    if not request.listing_input:
         raise HTTPException(
             status_code=422,
-            detail="Provide either (brand + title) or an Amazon ASIN.",
+            detail="Provide an Amazon product URL or ASIN so the exact listing can be fetched.",
         )
 
-    # 1. Product -- direct brand+title bypasses all fetching
-    product = await fetch_product(
-        request.asin or request.title or "manual",
-        manual_brand=request.brand,
-        manual_title=request.title,
-    )
+    # 1. Product
+    try:
+        product = await fetch_product(
+            request.listing_input,
+        )
+    except ProductFetchError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    # Allow caller to override the category if product fetch used the default
     if request.category and product.category == "Health & Household":
         product = product.model_copy(update={"category": request.category})
 
@@ -68,29 +69,28 @@ async def diagnose(request: DiagnoseRequest):
         raise HTTPException(
             status_code=422,
             detail=(
-                f"Could not resolve '{request.asin}' to a product. "
-                "Re-submit with 'brand' and 'title' fields."
+                f"Could not resolve '{request.listing_input}' to an Amazon listing. "
+                "Submit a canonical Amazon product URL or a valid 10-character ASIN."
             ),
         )
 
-    # 2. Generate buyer queries
+    # 2. Generate 6 buyer queries
     queries = await generate_queries(product)
     if not queries:
         raise HTTPException(status_code=500, detail="Query generation failed.")
 
-    # 3. Fan out to all 3 LLMs in parallel
+    # 3. Fan out to all 3 LLMs
     query_results = await run_all_queries(queries)
 
-    # 4. Parse mentions and competitors (batched LLM -- 1 call per query)
+    # 4. Parse mentions and competitors
     parsed_results = await parse_query_results(query_results, product.brand)
 
     # 5. Score
     score = compute_score(parsed_results, product.brand)
 
-    # 6. Recommendations
+    # 6. Generate 3 recommendations
     recommendations = await generate_recommendations(product, parsed_results, score)
 
-    # Build response
     summaries = []
     for pr in parsed_results:
         positions = [p for p in [pr.position.gpt4, pr.position.claude, pr.position.gemini]
