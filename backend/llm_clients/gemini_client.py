@@ -34,7 +34,10 @@ class GeminiClient(BaseLLMClient):
         last_error: Exception | None = None
         for model_name in ordered:
             try:
-                model = genai.GenerativeModel(model_name)
+                model = genai.GenerativeModel(
+                    model_name,
+                    generation_config={"temperature": 0, "max_output_tokens": max_tokens},
+                )
                 response = await asyncio.to_thread(model.generate_content, full_prompt)
                 health.mark_ok(model_name)
                 return response.text or ""

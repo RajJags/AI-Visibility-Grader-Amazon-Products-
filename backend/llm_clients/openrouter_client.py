@@ -45,6 +45,7 @@ class OpenRouterClient(BaseLLMClient):
             try:
                 response = await self._client.chat.completions.create(
                     model=model, messages=messages, max_tokens=max_tokens,
+                    temperature=0,
                 )
                 health.mark_ok(model)
                 return response.choices[0].message.content or ""

@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import type { Product } from "@/lib/api";
 
 interface Step {
   id: string;
@@ -30,7 +31,9 @@ function getStatus(step: Step, elapsed: number): StepStatus {
   return "pending";
 }
 
-export default function LoadingScreen({ productTitle }: { productTitle?: string }) {
+type ProductPreview = Pick<Product, "title" | "brand" | "image_url">;
+
+export default function LoadingScreen({ product }: { product?: ProductPreview | null }) {
   const [elapsed, setElapsed] = useState(0);
 
   useEffect(() => {
@@ -42,13 +45,34 @@ export default function LoadingScreen({ productTitle }: { productTitle?: string 
 
   return (
     <main className="min-h-screen flex flex-col items-center justify-center px-6 bg-white">
-      {/* Header */}
-      <div className="w-full max-w-md mb-10">
-        <p className="text-xs font-semibold uppercase tracking-widest text-neutral-400 mb-3">
-          Running diagnostic
-        </p>
-        {productTitle && (
-          <p className="text-sm text-neutral-500 truncate">{productTitle}</p>
+      {/* Product card — appears once /product resolves (~3s) */}
+      <div className="w-full max-w-md mb-10 min-h-[56px]">
+        {product ? (
+          <div className="flex items-center gap-3">
+            {product.image_url && (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={product.image_url}
+                alt={product.title}
+                className="w-12 h-12 object-contain rounded-lg border border-neutral-100 flex-shrink-0"
+              />
+            )}
+            <div className="min-w-0">
+              <p className="text-xs font-semibold uppercase tracking-widest text-neutral-400 mb-0.5">
+                {product.brand}
+              </p>
+              <p className="text-sm text-neutral-700 font-medium leading-snug line-clamp-2">
+                {product.title}
+              </p>
+            </div>
+          </div>
+        ) : (
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-widest text-neutral-400 mb-1">
+              Running diagnostic
+            </p>
+            <p className="text-sm text-neutral-400">Looking up product&hellip;</p>
+          </div>
         )}
       </div>
 

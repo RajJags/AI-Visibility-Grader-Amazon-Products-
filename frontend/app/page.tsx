@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { runDiagnostic, type DiagnoseResponse, APIError, API_URL } from "@/lib/api";
+import { runDiagnostic, fetchProductPreview, type DiagnoseResponse, type Product, APIError, API_URL } from "@/lib/api";
 import LoadingScreen      from "@/components/LoadingScreen";
 import ScoreHero          from "@/components/ScoreHero";
 import ModelCard          from "@/components/ModelCard";
@@ -12,7 +12,7 @@ import RecommendationCard from "@/components/RecommendationCard";
 // ── State machine ─────────────────────────────────────────────────────────────
 type State =
   | { status: "idle" }
-  | { status: "loading"; productTitle: string }
+  | { status: "loading"; product: Pick<Product, "title" | "brand" | "image_url"> | null }
   | { status: "result"; data: DiagnoseResponse }
   | { status: "error"; message: string };
 
@@ -30,8 +30,14 @@ export default function Home() {
     e.preventDefault();
     const listing = listingInput.trim();
     if (!listing) return;
-    setState({ status: "loading", productTitle: "Amazon listing" });
+    setState({ status: "loading", product: null });
     try {
+      try {
+        const product = await fetchProductPreview({ asin: listing });
+        setState((prev) => prev.status === "loading" ? { status: "loading", product } : prev);
+      } catch {
+        // Non-fatal: /diagnose will return the real error if product lookup fails.
+      }
       const data = await runDiagnostic({ asin: listing });
       setState({ status: "result", data });
     } catch (err) {
@@ -48,7 +54,7 @@ export default function Home() {
   }
 
   if (state.status === "loading") {
-    return <LoadingScreen productTitle={state.productTitle} />;
+    return <LoadingScreen product={state.product} />;
   }
 
   if (state.status === "result") {

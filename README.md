@@ -45,6 +45,7 @@ Pipeline:
    - Extracts ASIN and marketplace from URL or raw ASIN.
    - Fetches listing data via provider chain.
    - Extracts structured specs from API fields or Amazon detail tables.
+   - Exposes a lightweight `/product` preview endpoint so the loading screen can show the fetched product title, brand, and image before the full diagnostic finishes.
 
 2. Query Generator
    - Uses product title, category, bullets, and structured specs.
@@ -63,6 +64,7 @@ Pipeline:
 5. Scorer
    - Computes overall and per-model visibility scores.
    - Tracks top competitors and the number of scored queries.
+   - Reuses a full diagnostic cache so repeat runs for the same product return the same score.
 
 6. Recommender
    - Compares current listing language and specs against competitor attributes.
@@ -110,6 +112,14 @@ Typical run:
 - 1 recommendation call
 
 Latency depends on provider speed, free-tier limits, and backend cold starts.
+
+## Result Consistency
+
+LLM calls are configured with zero temperature, and full diagnostic responses are cached by ASIN, marketplace, optional category override, and cache version. Repeat runs return the cached diagnostic so the same product does not bounce between different visibility scores.
+
+For deployed environments, set `DIAG_CACHE_DIR` to a persistent disk path. Without persistent storage, the in-memory and local file cache still stabilizes repeat runs within the current backend instance, but a fresh deploy may start with an empty cache.
+
+To intentionally invalidate cached diagnostics after a scoring or prompt change, update `DIAG_CACHE_VERSION`.
 
 ## Setup
 
@@ -167,6 +177,9 @@ KEEPA_API_KEY=
 RAINFOREST_API_KEY=
 AMAZON_MARKETPLACE=IN
 FRONTEND_URL=http://localhost:3000
+DIAG_CACHE_DIR=
+DIAG_CACHE_VERSION=v3
+DIAG_CACHE_TTL_SECONDS=2592000
 ```
 
 ### `frontend/.env.local`
@@ -176,6 +189,34 @@ NEXT_PUBLIC_API_URL=http://localhost:8000
 ```
 
 ## API
+
+### `POST /product`
+
+Fetches only the resolved Amazon product. The frontend uses this first to show the real product and brand on the loading screen while the full diagnostic runs.
+
+Request:
+
+```json
+{
+  "asin": "B0XXXX"
+}
+```
+
+Simplified response:
+
+```json
+{
+  "asin": "B0XXXX",
+  "brand": "Brand",
+  "title": "Product title",
+  "category": "Category",
+  "bullets": ["Feature bullet"],
+  "image_url": "https://...",
+  "specs": {
+    "Battery Life": "7 Hours"
+  }
+}
+```
 
 ### `POST /diagnose`
 

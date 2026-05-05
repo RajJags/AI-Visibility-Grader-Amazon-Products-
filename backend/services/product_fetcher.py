@@ -54,7 +54,7 @@ _SKIP_SPEC_KEYS = {
 
 # ---------------------------------------------------------------------------
 # Product cache  (in-memory, per-process, 6-hour TTL)
-# Avoids re-hitting Rainforest/Canopy/scraper for the same ASIN within a session.
+# Avoids re-hitting Rainforest/Canopy/scraper for the same ASIN+marketplace.
 # ---------------------------------------------------------------------------
 import time as _time
 
@@ -62,15 +62,19 @@ _PRODUCT_CACHE: dict[str, tuple["Product", float]] = {}
 _CACHE_TTL = 6 * 3600  # 6 hours
 
 
-def _cache_get(asin: str) -> "Product | None":
-    entry = _PRODUCT_CACHE.get(asin)
+def _product_cache_key(asin: str, marketplace: str) -> str:
+    return f"{marketplace.upper()}:{asin.upper()}"
+
+
+def _cache_get(asin: str, marketplace: str) -> "Product | None":
+    entry = _PRODUCT_CACHE.get(_product_cache_key(asin, marketplace))
     if entry and (_time.time() - entry[1]) < _CACHE_TTL:
         return entry[0]
     return None
 
 
-def _cache_set(asin: str, product: "Product") -> None:
-    _PRODUCT_CACHE[asin] = (product, _time.time())
+def _cache_set(asin: str, marketplace: str, product: "Product") -> None:
+    _PRODUCT_CACHE[_product_cache_key(asin, marketplace)] = (product, _time.time())
 
 
 class ProductFetchError(RuntimeError):
@@ -577,7 +581,7 @@ async def fetch_product(raw_input: str, manual_brand: str | None = None,
                        title=raw_input, category=_STUB_CATEGORY,
                        bullets=[], image_url=None)
 
-    cached = _cache_get(asin)
+    cached = _cache_get(asin, marketplace)
     if cached:
         return cached
 
@@ -617,7 +621,7 @@ async def fetch_product(raw_input: str, manual_brand: str | None = None,
 
     if product:
         if product.brand != "MANUAL_ENTRY_REQUIRED":
-            _cache_set(asin, product)
+            _cache_set(asin, marketplace, product)
         return product
 
     if provider_errors:

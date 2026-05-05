@@ -16,6 +16,7 @@ export interface Product {
   category: string;
   bullets: string[];
   image_url: string | null;
+  specs: Record<string, string>;
 }
 
 export interface ModelMentions {
@@ -30,7 +31,7 @@ export interface Score {
   claude: number;
   gemini: number;
   top_competitors: Competitor[];
-  queries_used: number;  // may be < 10 if scoring phase hit timeout
+  queries_used: number;
 }
 
 export interface QuerySummary {
@@ -76,6 +77,20 @@ export interface DiagnoseRequest {
   brand?: string;
   title?: string;
   category?: string;
+}
+
+export async function fetchProductPreview(req: DiagnoseRequest): Promise<Product> {
+  const res = await fetch(`${API_URL}/product`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try { const body = await res.json(); detail = body.detail ?? detail; } catch { /* ignore */ }
+    throw new APIError(res.status, detail);
+  }
+  return res.json() as Promise<Product>;
 }
 
 export async function runDiagnostic(req: DiagnoseRequest): Promise<DiagnoseResponse> {

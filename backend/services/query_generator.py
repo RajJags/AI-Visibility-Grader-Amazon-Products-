@@ -61,6 +61,7 @@ Rules:
   - Vary the patterns
 
 Return ONLY a JSON array of 8 query strings. No other text.
+Do not output Step 1, object keys, labels, or metadata.
 """
 
 # Prompt when no structured specs are available (fall back to LLM inference)
@@ -77,7 +78,7 @@ Step 1 -- extract these four things about the product:
 
 Step 2 -- generate 8 search queries using the extracted values above.
 Use these query patterns, populated with real values from Step 1:
-  - "best budget [form_factor] for [use_case]"
+  - "best [form_factor] for [use_case]"
   - "[form_factor] with [top_spec] for [use_case]"
   - "[form_factor] good for [use_case] and [use_case]"
   - "most [attribute] [form_factor] in [price_tier]"
@@ -92,6 +93,7 @@ Rules:
   - Vary the patterns -- do not repeat the same structure 8 times
 
 Return ONLY a JSON array of 8 query strings. No other text.
+Do not output Step 1, object keys, labels, or metadata.
 """
 
 _SPEC_UNITS = frozenset(["gb", "mb", "tb", "mp", "mah", "hz", "ghz", "mhz",
@@ -276,7 +278,7 @@ def _add_missing_under_currency(query: str, currency: str) -> str:
 
 def _clean_query_text(query: str, product: Product | None = None) -> str:
     q = re.sub(r"\s+", " ", query.strip().lower())
-    q = q.strip(" .?!,;:")
+    q = q.strip(" .?!,;:\"'[]{}")
 
     q = re.sub(r"\bunder\s+budget\s+(\d+)\b", r"under \1", q)
     q = re.sub(r"\bin\s+budget\b", "", q)
@@ -298,6 +300,50 @@ def _clean_query_text(query: str, product: Product | None = None) -> str:
     q = re.sub(r"\baud\b", "AUD", q)
     q = re.sub(r"\bjpy\b", "JPY", q)
     return q
+
+
+_QUERY_LIST_KEYS = (
+    "queries", "search_queries", "buyer_queries", "generated_queries",
+    "query_strings", "step_2", "step2",
+)
+_META_KEYS = {
+    "price_tier", "top_specs", "use_cases", "form_factor", "step_1", "step1",
+    "specs", "product", "category", "analysis",
+}
+
+
+def _looks_like_query(value: str) -> bool:
+    q = value.strip().strip(",")
+    q_lower = q.lower().strip(" \"'")
+    if not q_lower or len(q_lower) <= 5:
+        return False
+    if any(q_lower.startswith(f"{key}:") or q_lower.startswith(f'"{key}"') for key in _META_KEYS):
+        return False
+    if re.search(r'^\s*["\']?(?:' + "|".join(_META_KEYS) + r')["\']?\s*:', q_lower):
+        return False
+    if any(ch in q_lower for ch in "{}[]"):
+        return False
+    if q_lower.count(":") > 0:
+        return False
+    if re.fullmatch(r"[\w\s-]+", q_lower) and len(q_lower.split()) <= 2:
+        return False
+    return True
+
+
+def _coerce_query_list(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if isinstance(item, str) and _looks_like_query(item)]
+    if isinstance(value, dict):
+        for key in _QUERY_LIST_KEYS:
+            if key in value:
+                found = _coerce_query_list(value[key])
+                if found:
+                    return found
+        strings: list[str] = []
+        for item in value.values():
+            strings.extend(_coerce_query_list(item))
+        return strings
+    return []
 
 
 def _is_branded(query: str, brand: str, title: str) -> bool:
@@ -326,7 +372,11 @@ def _parse_queries(raw: str) -> list[str]:
                 raw = part
                 break
     try:
-        return TypeAdapter(list[str]).validate_json(raw)[:8]
+        data = json.loads(raw)
+        queries = _coerce_query_list(data)
+        if queries:
+            return queries[:8]
+        return TypeAdapter(list[str]).validate_python(data)[:8]
     except (json.JSONDecodeError, ValidationError):
         pass
     m = re.search(r"\[.*\]", raw, re.DOTALL)
@@ -338,7 +388,8 @@ def _parse_queries(raw: str) -> list[str]:
     lines = []
     for line in raw.splitlines():
         line = re.sub(r"^[\d]+[\.\)]\s*|^[-*]\s*", "", line.strip()).strip('"\'')
-        if len(line) > 5:
+        line = line.rstrip(",")
+        if _looks_like_query(line):
             lines.append(line)
     return lines[:8]
 
@@ -389,7 +440,10 @@ async def generate_queries(product: Product) -> list[str]:
             _query_cache_set(product.asin, result)
             return result
         if attempt == 0:
-            prompt += "\n\nMust return exactly 8 queries. No brand names. Use real numbers from the specs."
+            prompt += (
+                "\n\nMust return exactly 8 queries as a plain JSON array of strings. "
+                "No brand names. No object keys. No Step 1 metadata. Use real numbers from the specs."
+            )
 
     seen = {q.lower() for q in candidates}
     for fb in _fallbacks_for(product):
