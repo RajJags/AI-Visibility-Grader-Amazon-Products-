@@ -52,6 +52,27 @@ _SKIP_SPEC_KEYS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Product cache  (in-memory, per-process, 6-hour TTL)
+# Avoids re-hitting Rainforest/Canopy/scraper for the same ASIN within a session.
+# ---------------------------------------------------------------------------
+import time as _time
+
+_PRODUCT_CACHE: dict[str, tuple["Product", float]] = {}
+_CACHE_TTL = 6 * 3600  # 6 hours
+
+
+def _cache_get(asin: str) -> "Product | None":
+    entry = _PRODUCT_CACHE.get(asin)
+    if entry and (_time.time() - entry[1]) < _CACHE_TTL:
+        return entry[0]
+    return None
+
+
+def _cache_set(asin: str, product: "Product") -> None:
+    _PRODUCT_CACHE[asin] = (product, _time.time())
+
+
 class ProductFetchError(RuntimeError):
     """Raised when exact listing lookup cannot run because a provider is unavailable."""
 
@@ -556,6 +577,10 @@ async def fetch_product(raw_input: str, manual_brand: str | None = None,
                        title=raw_input, category=_STUB_CATEGORY,
                        bullets=[], image_url=None)
 
+    cached = _cache_get(asin)
+    if cached:
+        return cached
+
     # Rainforest first whenever the key is set (reliable on all environments).
     # On cloud without a Rainforest key, skip scraping entirely  -  Amazon blocks
     # cloud IP ranges almost immediately, so the 10-second timeout is dead time.
@@ -591,6 +616,8 @@ async def fetch_product(raw_input: str, manual_brand: str | None = None,
         product = product or scraped
 
     if product:
+        if product.brand != "MANUAL_ENTRY_REQUIRED":
+            _cache_set(asin, product)
         return product
 
     if provider_errors:

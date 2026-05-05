@@ -32,6 +32,25 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="AI Visibility Grader", version="0.1.0", lifespan=lifespan)
 
+# ---------------------------------------------------------------------------
+# Full diagnostic cache  (keyed by ASIN, 1-hour TTL)
+# Repeat runs on the same product return instantly with zero LLM calls.
+# ---------------------------------------------------------------------------
+import time as _time
+_DIAG_CACHE: dict[str, tuple[DiagnoseResponse, float]] = {}
+_DIAG_CACHE_TTL = 3600  # 1 hour
+
+
+def _diag_cache_get(asin: str) -> DiagnoseResponse | None:
+    entry = _DIAG_CACHE.get(asin)
+    if entry and (_time.time() - entry[1]) < _DIAG_CACHE_TTL:
+        return entry[0]
+    return None
+
+
+def _diag_cache_set(asin: str, response: DiagnoseResponse) -> None:
+    _DIAG_CACHE[asin] = (response, _time.time())
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -53,6 +72,15 @@ async def diagnose(request: DiagnoseRequest):
             status_code=422,
             detail="Provide an Amazon product URL or ASIN so the exact listing can be fetched.",
         )
+
+    # Fast path: return cached diagnostic if available
+    try:
+        _asin_key, _ = __import__("services.product_fetcher", fromlist=["_extract_listing"])._extract_listing(request.listing_input)
+        cached_diag = _diag_cache_get(_asin_key)
+        if cached_diag:
+            return cached_diag
+    except Exception:
+        _asin_key = None
 
     # 1. Product
     try:
@@ -102,7 +130,10 @@ async def diagnose(request: DiagnoseRequest):
             your_position=min(positions) if positions else None,
         ))
 
-    return DiagnoseResponse(
+    response = DiagnoseResponse(
         product=product, score=score, queries=summaries,
         top_competitors=score.top_competitors, recommendations=recommendations,
     )
+    if _asin_key:
+        _diag_cache_set(_asin_key, response)
+    return response

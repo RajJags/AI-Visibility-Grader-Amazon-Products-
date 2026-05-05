@@ -8,6 +8,25 @@ from models import Product
 
 _SYSTEM = "You are a search query strategist. Output only valid JSON."
 
+# ---------------------------------------------------------------------------
+# Query cache  (keyed by ASIN, 6-hour TTL matching product cache)
+# Same product = same specs = same queries every time.
+# ---------------------------------------------------------------------------
+import time as _time
+_QUERY_CACHE: dict[str, tuple[list[str], float]] = {}
+_QUERY_CACHE_TTL = 6 * 3600
+
+
+def _query_cache_get(asin: str) -> list[str] | None:
+    entry = _QUERY_CACHE.get(asin)
+    if entry and (_time.time() - entry[1]) < _QUERY_CACHE_TTL:
+        return entry[0]
+    return None
+
+
+def _query_cache_set(asin: str, queries: list[str]) -> None:
+    _QUERY_CACHE[asin] = (queries, _time.time())
+
 # Prompt when structured specs are available (from Amazon product detail table / API)
 _PROMPT_WITH_SPECS = """Product: {title}
 Category: {category}
@@ -337,6 +356,10 @@ def _clean_queries(queries: list[str], product: Product) -> list[str]:
 
 
 async def generate_queries(product: Product) -> list[str]:
+    cached = _query_cache_get(product.asin)
+    if cached:
+        return cached
+
     client = GenerationClient()
     bullets_text = "\n".join(f"  - {b}" for b in product.bullets[:6]) if product.bullets else "  N/A"
 
@@ -362,7 +385,9 @@ async def generate_queries(product: Product) -> list[str]:
         parsed = _clean_queries(_parse_queries(raw), product)
         candidates = [q for q in parsed if not _is_branded(q, product.brand, product.title)]
         if len(candidates) >= 6:
-            return candidates[:6]
+            result = candidates[:6]
+            _query_cache_set(product.asin, result)
+            return result
         if attempt == 0:
             prompt += "\n\nMust return exactly 8 queries. No brand names. Use real numbers from the specs."
 
@@ -374,4 +399,5 @@ async def generate_queries(product: Product) -> list[str]:
         if fb.lower() not in seen:
             candidates.append(fb)
             seen.add(fb.lower())
+    _query_cache_set(product.asin, candidates[:6])
     return candidates[:6]

@@ -218,6 +218,67 @@ def _parse_recs(raw: str) -> list[dict]:
     return []
 
 
+def _gap_based_recs(
+    gaps: list[tuple[str, int, list[str]]],
+    results: list[ParsedQueryResult],
+) -> list[Recommendation]:
+    """
+    Build product-specific recs directly from gap + query-type data.
+    Called when all LLM attempts fail — never shows generic template text.
+    """
+    recs: list[Recommendation] = []
+
+    for attr, weight, queries in gaps[:3]:
+        query_ctx = f'"{queries[0]}"' if queries else "buyer queries in this category"
+        priority = "high" if weight >= 4 else "medium"
+        recs.append(Recommendation(
+            title=f'Add "{attr}" to your listing',
+            description=(
+                f'Competitors were recommended for "{attr}" in queries like {query_ctx}. '
+                "Adding this to a product bullet targets the exact searches where you're currently missing."
+            ),
+            priority=priority,
+        ))
+
+    # Pad with weakest query-type advice if we have room
+    if len(recs) < 3:
+        buckets: dict[str, list[bool]] = {}
+        for r in results:
+            won = bool(r.mentions.gpt4 or r.mentions.claude or r.mentions.gemini)
+            qt = _classify_query(r.query)
+            buckets.setdefault(qt, []).append(won)
+        weakest = min(
+            ((qt, sum(v)/len(v)) for qt, v in buckets.items() if qt != "general"),
+            key=lambda x: x[1], default=None
+        )
+        if weakest:
+            qt, rate = weakest
+            wins = int(rate * len(buckets[qt]))
+            total = len(buckets[qt])
+            advice = {
+                "attribute-specific": (
+                    "State key specs explicitly in title and first bullet",
+                    f"You won {wins}/{total} attribute-specific queries. "
+                    "AI models surface products whose listing text contains the exact spec values buyers search for — include numbers and units.",
+                ),
+                "comparison": (
+                    "Add a differentiation bullet explaining your key advantage",
+                    f"You won {wins}/{total} comparison queries. "
+                    "AI assistants favour listings that name the one thing this product wins on versus alternatives.",
+                ),
+                "problem-first": (
+                    "Open bullet 1 with a specific activity, not a feature",
+                    f"You won {wins}/{total} problem-first queries. "
+                    "Buyers phrase searches as activities; AI matches them to listings that name the same activity explicitly.",
+                ),
+            }
+            if qt in advice:
+                title, desc = advice[qt]
+                recs.append(Recommendation(title=title, description=desc, priority="high"))
+
+    return recs
+
+
 async def generate_recommendations(
     product: Product,
     results: list[ParsedQueryResult],
@@ -225,16 +286,15 @@ async def generate_recommendations(
 ) -> list[Recommendation]:
 
     listing_text = product.title + "\n" + "\n".join(f"- {b}" for b in product.bullets[:6])
-    # Pass specs to listing tokens so confirmed spec values aren't flagged as gaps
     tokens = _listing_tokens(product.title, product.bullets, specs=product.specs)
     gaps = _find_gaps(results, product.brand, tokens)[:3]
 
     if gaps:
         gap_lines = "\n".join(
-            f"  - \"{attr}\" (score {n}, queries: {', '.join(qs)})"
+            f'  - "{attr}" (score {n}, queries: {", ".join(qs)})'
             for attr, n, qs in gaps
         )
-        prompt = _PROMPT.format(
+        full_prompt = _PROMPT.format(
             title=product.title,
             brand=product.brand,
             category=product.category,
@@ -249,7 +309,7 @@ async def generate_recommendations(
             gaps=gap_lines,
         )
     else:
-        prompt = _FALLBACK_PROMPT.format(
+        full_prompt = _FALLBACK_PROMPT.format(
             title=product.title,
             brand=product.brand,
             category=product.category,
@@ -259,41 +319,62 @@ async def generate_recommendations(
             won_queries=_fmt_queries(results, won=True),
         )
 
-    raw = ""
-    try:
-        raw = await GeminiClient().query(prompt, system=_SYSTEM, max_tokens=700)
-    except Exception:
-        pass
-    if not raw:
-        raw = await GenerationClient().query(prompt, system=_SYSTEM, max_tokens=700)
+    # Compact retry prompt — same core ask, less context, easier for the model to return clean JSON
+    retry_prompt = (
+        f"Product: {product.title} | Brand: {product.brand} | Score: {score.overall}/100\n"
+        f"Top gaps: {gap_lines if gaps else 'none'}\n"
+        "Give 3 listing improvements as JSON: "
+        '[{"title":"<8 words>","description":"2 sentences","priority":"high|medium|low"}]'
+    )
 
-    data = _parse_recs(raw)
-    recs: list[Recommendation] = [
-        Recommendation(
-            title=str(item.get("title", "Improve listing")),
-            description=str(item.get("description", "")),
-            priority=str(item.get("priority", "medium")).lower(),
-        )
-        for item in data[:3] if isinstance(item, dict)
+    # Three attempts: Gemini full → GenerationClient full → Gemini compact
+    attempts = [
+        (GeminiClient(),       full_prompt,  700),
+        (GenerationClient(),   full_prompt,  700),
+        (GeminiClient(),       retry_prompt, 400),
     ]
 
-    fallbacks = [
-        ("Add use-case scenarios to first two bullets",
-         "State specific activities in bullets 1-2. "
-         "AI models match problem-first queries to listings that name the activity explicitly.",
-         "high"),
-        ("Include quantified performance benchmarks",
-         "Add measurable claims in a dedicated bullet. "
-         "AI assistants surface products with verifiable data over vague descriptions.",
-         "high"),
-        ("Expand A+ content with buyer-intent language",
-         "Use problem-solution framing in A+ sections. "
-         "AI models weight structured content mirroring how buyers phrase queries.",
-         "medium"),
-    ]
-    for t, d, p in fallbacks:
+    recs: list[Recommendation] = []
+    for client, prompt, max_tok in attempts:
         if len(recs) >= 3:
             break
-        recs.append(Recommendation(title=t, description=d, priority=p))
+        try:
+            raw = await client.query(prompt, system=_SYSTEM, max_tokens=max_tok)
+            data = _parse_recs(raw)
+            recs = [
+                Recommendation(
+                    title=str(item.get("title", "")),
+                    description=str(item.get("description", "")),
+                    priority=str(item.get("priority", "medium")).lower(),
+                )
+                for item in data[:3]
+                if isinstance(item, dict) and item.get("title") and item.get("description")
+            ]
+        except Exception:
+            pass
 
-    return recs
+    # All LLM attempts failed — build specific recs from the gap data we already have.
+    # This is always product-specific; generic template text is never shown.
+    if len(recs) < 3:
+        specific = _gap_based_recs(gaps, results)
+        seen = {r.title.lower() for r in recs}
+        for r in specific:
+            if len(recs) >= 3:
+                break
+            if r.title.lower() not in seen:
+                recs.append(r)
+
+    # Absolute last resort — no gap data, no LLM, nothing to work with.
+    # Honest and actionable rather than fake generic advice.
+    if not recs:
+        recs.append(Recommendation(
+            title="Review the query breakdown above",
+            description=(
+                "We couldn't generate specific recommendations this run. "
+                "The queries where competitors appeared but you didn't are your clearest action items — "
+                "align your listing language to match how buyers phrased those searches."
+            ),
+            priority="medium",
+        ))
+
+    return recs[:3]
